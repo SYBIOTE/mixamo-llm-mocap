@@ -120,14 +120,20 @@ What the stage does, in order:
    still in the world), and **single support**: when one foot is more than
    15 cm above the other and the lower one is within 10 cm of the floor,
    the lower one carries the body — through the spin plate's kicks GVHMR
-   slides it at up to 2 m/s while the video shows it fixed. Runs of the
-   same foot separated by a confidence dip, with the foot unmoved, are
-   joined.
+   slides it at up to 2 m/s while the video shows it fixed. And where
+   nothing else plants a foot (no network flag, nothing still on screen)
+   and the body is not in the air, the **lower foot** does, with 2 cm of
+   hysteresis between the feet — the legacy lift's rule through the spin
+   plate's turning footwork, where this retarget's feet otherwise floated
+   3 cm. Runs of the same foot separated by a confidence dip, with the
+   foot unmoved, are joined.
 4. **Planted feet stay put**: where a foot is flagged (network, image, or
    single support), the body's horizontal translation absorbs the foot's
    motion (GVHMR's own rule, re-applied on the refined pose, anchored on
    the stillest flagged joint: the ball of a support foot whose heel is
-   up, so the body turns about it).
+   up, so the body turns about it). The correction is smoothed over a
+   frame (`pin_smooth`): as the support passes from one foot to the
+   other, the body would otherwise jolt.
 5. **Floor**: on planted frames the lowest sole goes on the floor.
 6. **Camera footfalls**: each footfall takes the camera correction
    measured when it lands; later disagreement while it stays planted is
@@ -178,7 +184,8 @@ What the stage does, in order:
 `contact_slide_speed` 0.12 m/s, `contact_max_drift` 0.04 m,
 `contact_heel_max_s` 0.5 s, `contact_still_height` 0.12 m,
 `contact_swing_height` 0.15 m, `contact_support_height` 0.10 m,
-`contact_max_turn_deg` 20, `sink_tolerance` 0.01 m, `foot_tilt_fix` true,
+`contact_max_turn_deg` 20, `contact_lower_foot` true, `contact_switch_height`
+0.02 m, `pin_smooth` 1, `sink_tolerance` 0.01 m, `foot_tilt_fix` true,
 `contact_image_anchor` false (with `contact_anchor_max` 0.12 m,
 `contact_anchor_drop` 0.015 m), `contact_ramp` 4, `max_hips_drop` 0.05 m,
 `ground_sigma` 3, `hand_relaxed` 0.3, `hand_detect` true, `pin_static_feet` true,
