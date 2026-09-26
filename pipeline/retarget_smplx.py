@@ -45,7 +45,7 @@ What cannot be copied, and is solved instead
   - foot contacts: a foot is planted when the network's contact detector
     says so, when its sole sits still on the floor, when it does not move
     on screen, or when it carries the body alone (the other foot well
-    up). Planted segments lock flat, or pivot on the ball (heel raised) or
+    up); where none of that says which foot is down, the lower one is. Planted segments lock flat, or pivot on the ball (heel raised) or
     briefly on the heel (toes up), with short ramps in and out; a real
     slide is left to slide, and no free foot goes under the floor.
   - fingers: GVHMR estimates none. detect_hands.py reads each hand on a
@@ -487,7 +487,7 @@ def floor_envelope(h: np.ndarray, fps: float, half_s: float = 1.5) -> np.ndarray
     return np.array([h[max(0, t - w):t + w + 1].min() for t in range(len(h))])
 
 
-def single_support(local, transl, rj, foot, fps, opts, lift=None):
+def single_support(local, transl, rj, foot, fps, opts, lift=None, evidence=None):
     """The foot that carries the body alone, and the joints to pin for it.
 
     One foot well above the other (a kick, a knee, a step) means the lower
@@ -519,10 +519,29 @@ def single_support(local, transl, rj, foot, fps, opts, lift=None):
         low[side] = np.minimum(heel_h[side], ball_h[side])
     floor = floor_envelope(np.minimum(low["L"], low["R"]), fps)
     swing, near = float(opts["contact_swing_height"]), float(opts["contact_support_height"])
+    # Where nothing else says a foot is down (`evidence`: the network's
+    # flag, a foot still on screen), the lower foot is, while the body is
+    # not in the air (`contact_lower_foot`) — with a little hysteresis so
+    # two feet at one height do not flicker. The legacy lift did this through
+    # the spin plate's turning footwork, and its feet stayed on the floor
+    # where this retarget's floated 3 cm. Everywhere, it cost leg accuracy
+    # (the other evidence already plants those feet, better).
+    hyst = float(opts["contact_switch_height"])
+    lower = np.zeros(T, dtype=int)                     # 0 = L, 1 = R
+    for t in range(T):
+        prev = lower[t - 1] if t else int(low["R"][0] < low["L"][0])
+        cur, oth = (low["L"][t], low["R"][t]) if prev == 0 else (low["R"][t], low["L"][t])
+        lower[t] = prev if cur <= oth + hyst else 1 - prev
+    grounded = np.minimum(low["L"], low["R"]) - floor < near
+    if evidence is not None:
+        grounded &= ~evidence
     weights = np.zeros((T, 4))
     support = np.zeros((T, 2), dtype=bool)
     for k, (side, other) in enumerate((("L", "R"), ("R", "L"))):
-        on = clean_mask((low[other] - low[side] > swing) & (low[side] - floor < near), 3, 2)
+        on = (low[other] - low[side] > swing) & (low[side] - floor < near)
+        if opts.get("contact_lower_foot", True):
+            on |= grounded & (lower == k)
+        on = clean_mask(on, 3, 2)
         support[:, k] = on
         heel_up = heel_h[side] - ball_h[side] > 0.02
         weights[:, 2 * k] = (on & ~heel_up).astype(float)
@@ -854,10 +873,19 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     still2d = still_in_image(src, rs, float(opts["contact_still_px"]))
     # the camera's height correction does not depend on horizontal pinning
     lift = camera_drift(src, rj, rs, R_c2w, t_c2w, np.eye(3), opts)[:, 1] if use_cam else None
-    sup_w, support = single_support(rs["local"], rs["transl"], rj, foot, dst_fps, opts, lift)
+    # frames where the network or the image already puts a foot down
+    evidence = (rs["static"][:, :4].max(1) > float(opts["contact_threshold"])) | still2d.any(1)
+    sup_w, support = single_support(rs["local"], rs["transl"], rj, foot, dst_fps, opts, lift,
+                                    evidence=clean_mask(evidence, 1, 3))
     if opts.get("pin_static_feet", True):
         pin_w = np.maximum(np.maximum(rs["static"][:, :4], np.repeat(still2d.astype(float), 2, axis=1)), sup_w)
-        rs["transl"] = pin_static_feet(rs["local"], rs["transl"], rj, pin_w)
+        pinned = pin_static_feet(rs["local"], rs["transl"], rj, pin_w)
+        # The correction switches anchor as the support passes from one foot
+        # to the other; smoothed over a few frames (the correction, never the
+        # motion), the body does not jolt at the hand-over (spin plate: hips
+        # jerk doubled without it).
+        corr = gaussian_smooth(pinned - rs["transl"], float(opts["pin_smooth"]))
+        rs["transl"] = rs["transl"] + corr
     Ps, Rs = SB.fk_local(rs["local"], rs["transl"], rj)
     h0 = float(SB.heading(Rs[0, 0]))
     Ry = SB.yaw_matrix(np.array(-h0))
@@ -1407,7 +1435,7 @@ def main() -> None:
             "contact_geo_height": 0.025, "contact_geo_speed": 0.2, "contact_heel_height": 0.03,
             "contact_max_drift": 0.04, "contact_slide_speed": 0.12, "contact_still_px": 15.0,
             "contact_still_height": 0.12, "contact_swing_height": 0.15, "contact_support_height": 0.10,
-            "contact_max_turn_deg": 20.0, "sink_tolerance": 0.01, "contact_anchor_max": 0.12, "contact_anchor_drop": 0.015,
+            "contact_max_turn_deg": 20.0, "contact_switch_height": 0.02, "pin_smooth": 1.0, "sink_tolerance": 0.01, "contact_anchor_max": 0.12, "contact_anchor_drop": 0.015,
             "max_hips_drop": 0.05,
             "contact_heel_max_s": 0.5, "ground_sigma": 3.0, "contact_ramp": 4, "hand_relaxed": 0.3,
             "camera_fit_frames": 12, "camera_root": True, "camera_smooth": 5.0}
