@@ -116,6 +116,11 @@ def dump_rig_profile(arm, out_path: Path) -> dict:
         "rest": rest,
         "lengths": lengths,
     }
+    # The SMPL-X retarget (retarget_smplx.py) needs every bone's rest
+    # matrix, not just joint positions.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bl_motion
+    profile.update(bl_motion.rig_table(arm))
     out_path.write_text(json.dumps(profile, indent=1), encoding="utf-8")
     return profile
 

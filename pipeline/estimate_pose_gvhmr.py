@@ -207,7 +207,57 @@ def side_track(tracker, video_path: str, person: str, n_people: int = 2):
     return out
 
 
-def run_gvhmr(video: Path, person: str | None = None) -> dict:
+def predict(model, data: dict, postproc: str) -> dict:
+    """GVHMR inference, keeping the network's per-frame contact
+    confidences (`static_conf_logits`) that DemoPL.predict throws away.
+
+    postproc:
+      full  GVHMR's demo behaviour: the static-camera trajectory fix, then
+            a CCD IK that pulls every joint the network calls "static"
+            toward where it was the frame before — ankles, balls of the
+            feet AND wrists. Built for hands resting on things; on a
+            fighter it can hold a wrist back at the apex of a punch.
+      feet  the same, but wrists are never static (default for the
+            SMPL-X retarget: feet cleaned, strikes untouched).
+      none  the raw network output.
+
+    Returns the usual pred dict plus `static_conf` (L, 6): probabilities
+    in smplx_body.STATIC_JOINTS order.
+    """
+    from hmr4d.model.gvhmr.utils.postprocess import pp_static_joint_cam, process_ik
+    from hmr4d.utils.geo.hmr_cam import normalize_kp2d
+    from hmr4d.utils.net_utils import detach_to_cpu
+
+    batch = {  # exactly DemoPL.predict's batch
+        "length": data["length"][None],
+        "obs": normalize_kp2d(data["kp2d"], data["bbx_xys"])[None],
+        "bbx_xys": data["bbx_xys"][None],
+        "K_fullimg": data["K_fullimg"][None],
+        "cam_angvel": data["cam_angvel"][None],
+        "f_imgseq": data["f_imgseq"][None],
+    }
+    batch = {k: v.cuda() for k, v in batch.items()}
+    pipe = model.pipeline
+    with torch.no_grad():
+        out = pipe.forward(batch, train=False, postproc=False, static_cam=True)
+        logits = out["static_conf_logits"].clone()
+        if postproc in ("full", "feet"):
+            if postproc == "feet":
+                out["static_conf_logits"][..., 4:] = -1e4      # wrists: never static
+            out["pred_smpl_params_global"]["transl"] = pp_static_joint_cam(out, pipe.endecoder)
+            body_pose = process_ik(out, pipe.endecoder)
+            out["pred_smpl_params_global"]["body_pose"] = body_pose
+            out["pred_smpl_params_incam"]["body_pose"] = body_pose
+    return detach_to_cpu({
+        "smpl_params_global": {k: v[0] for k, v in out["pred_smpl_params_global"].items()},
+        "smpl_params_incam": {k: v[0] for k, v in out["pred_smpl_params_incam"].items()},
+        "K_fullimg": data["K_fullimg"],
+        "static_conf": logits[0].float().sigmoid(),
+        "postproc": postproc,
+    })
+
+
+def run_gvhmr(video: Path, person: str | None = None, postproc: str = "full") -> dict:
     import hydra
     from hydra import compose, initialize_config_module
 
@@ -215,7 +265,6 @@ def run_gvhmr(video: Path, person: str | None = None) -> dict:
     from hmr4d.model.gvhmr.gvhmr_pl_demo import DemoPL
     from hmr4d.utils.geo.hmr_cam import estimate_K, get_bbx_xys_from_xyxy
     from hmr4d.utils.geo_transform import compute_cam_angvel
-    from hmr4d.utils.net_utils import detach_to_cpu
     from hmr4d.utils.preproc import Extractor, Tracker, VitPoseExtractor
     from hmr4d.utils.video_io_utils import get_video_lwh, get_video_reader, get_writer
 
@@ -259,7 +308,14 @@ def run_gvhmr(video: Path, person: str | None = None) -> dict:
         torch.save(extractor.extract_video_features(cfg.video_path, bbx_xys), paths.vit_features)
         del extractor
 
-    if not Path(paths.hmr4d_results).exists():
+    # `full` keeps GVHMR's own results file (the landmark pipeline's
+    # historical input); the other modes cache beside it, so switching
+    # modes never recomputes the preprocessing.
+    results_path = Path(paths.hmr4d_results)
+    if postproc != "full":
+        results_path = results_path.with_name(f"hmr4d_results_pp-{postproc}.pt")
+    pred = torch.load(results_path) if results_path.exists() else None
+    if pred is None or "static_conf" not in pred:
         length, width, height = get_video_lwh(cfg.video_path)
         K_fullimg = estimate_K(width, height).repeat(length, 1, 1)
         data = {
@@ -273,11 +329,70 @@ def run_gvhmr(video: Path, person: str | None = None) -> dict:
         model: DemoPL = hydra.utils.instantiate(cfg.model, _recursive_=False)
         model.load_pretrained_model(cfg.ckpt_path)
         model = model.eval().cuda()
-        pred = detach_to_cpu(model.predict(data, static_cam=True))
-        pred.pop("net_outputs", None)  # heavy intermediates, not needed
-        torch.save(pred, paths.hmr4d_results)
+        fresh = predict(model, data, postproc)
+        if pred is None:
+            pred = fresh
+        else:
+            # A cache written before the contact confidences were kept:
+            # add them and leave the cached poses exactly as they were.
+            pred["static_conf"] = fresh["static_conf"]
+            pred["postproc"] = postproc
+        torch.save(pred, results_path)
 
-    return {"pred": torch.load(paths.hmr4d_results), "cfg": cfg}
+    pred["kp2d"] = torch.load(paths.vitpose)
+    return {"pred": pred, "cfg": cfg}
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b — the SMPL-X parameters themselves, for retarget_smplx.py.
+
+def export_smplx(pred: dict, out_path: Path, fps: float, wh: tuple[int, int]) -> dict:
+    """Write smplx.npz: everything the rotation retarget needs, with no
+    torch and no gated body model required downstream.
+
+    The landmark export below reduces the body to 33 points and throws
+    the joint rotations away — twist of the forearms, chest and head is
+    not recoverable from positions. This keeps them.
+    """
+    sys.path.insert(0, str(REPO / "pipeline"))
+    import smplx_body as SB
+
+    def np64(t):
+        return t.detach().cpu().numpy().astype(np.float64)
+
+    g = {k: np64(v) for k, v in pred["smpl_params_global"].items()}
+    c = {k: np64(v) for k, v in pred["smpl_params_incam"].items()}
+    betas = g["betas"].mean(axis=0)
+    rest = SB.shaped_rest(CHECKPOINTS["smplx_neutral"], betas)
+    L = g["body_pose"].shape[0]
+    static = np64(pred["static_conf"]) if "static_conf" in pred else np.full((L, 6), np.nan)
+    kp2d = np64(pred["kp2d"]) if "kp2d" in pred else np.zeros((L, 17, 3))
+    payload = {
+        "source": np.array("gvhmr_siga24"),
+        "postproc": np.array(str(pred.get("postproc", "full"))),
+        "fps": np.array(float(fps)),
+        "width": np.array(int(wh[0])), "height": np.array(int(wh[1])),
+        # gravity-aligned world ("ay": y up, arbitrary yaw, metres)
+        "global_orient": g["global_orient"], "body_pose": g["body_pose"], "transl": g["transl"],
+        # camera frame (OpenCV: x right, y down, z forward)
+        "incam_global_orient": c["global_orient"], "incam_transl": c["transl"],
+        "incam_body_pose": c["body_pose"],
+        "K": np64(pred["K_fullimg"][0]),
+        "betas": betas,
+        # performer-shaped rest skeleton (SMPL-X canonical axes, metres)
+        "rest_joints": rest["joints"],
+        "foot": np.array(json.dumps(rest["foot"])),
+        "body_height": np.array(rest["height"]),
+        # GVHMR's own contact detector: P(static) per frame for
+        # L_ankle, L_foot, R_ankle, R_foot, L_wrist, R_wrist
+        "static_conf": static,
+        # ViTPose COCO-17 keypoints (pixels + confidence) — the 2D evidence
+        # the fidelity check projects the retarget against
+        "kp2d": kp2d,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **payload)
+    return {"frames": L, "height_m": round(rest["height"], 3), "postproc": str(payload["postproc"])}
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +534,42 @@ def project(p: np.ndarray, K: np.ndarray, wh: tuple[int, int]) -> np.ndarray:
     return np.array([u, v, 0.0])
 
 
+def foot_keypoints(video: Path, out: Path, args):
+    """Heel/toe 2D keypoints for the refinement (detect_feet.py, MediaPipe).
+
+    MediaPipe does not live in the GVHMR venv, so the detector runs in
+    whichever Python has it: this one, --feet-python, or `python` on PATH.
+    Cached next to the plate; returns None (refinement without feet) when
+    no detector is available or the plate has two performers.
+    """
+    import importlib.util
+    import shutil
+    import subprocess
+
+    if out.exists():
+        return np.load(out)["kp"]
+    if args.person:
+        print("foot keypoints: skipped (multi-person plate; MediaPipe tracks one pose)")
+        return None
+    script = REPO / "pipeline" / "detect_feet.py"
+    if importlib.util.find_spec("mediapipe") is not None:
+        cmd = [sys.executable]
+    else:
+        exe = args.feet_python or shutil.which("python") or shutil.which("python3")
+        cmd = [exe] if exe else None
+    if cmd is None:
+        print("foot keypoints: no Python with mediapipe found (pass --feet-python); refining without feet")
+        return None
+    res = subprocess.run(cmd + [str(script), "--video", str(video), "--out", str(out)],
+                         capture_output=True, text=True)
+    if res.returncode != 0 or not out.exists():
+        print("foot keypoints: detect_feet.py failed; refining without feet\n" + res.stderr[-800:])
+        return None
+    if res.stdout.strip():
+        print(res.stdout.strip().splitlines()[-1])
+    return np.load(out)["kp"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="GVHMR -> MediaPipe-style landmarks.json")
     ap.add_argument("--video", required=True, type=Path)
@@ -427,6 +578,20 @@ def main() -> None:
     ap.add_argument("--person", default=None,
                     help="multi-person plates: which performer to estimate — 'left', 'right', "
                          "or a 0-based slot index ordered left to right. Omit for a solo plate.")
+    ap.add_argument("--postproc", choices=["full", "feet", "none"], default="feet",
+                    help="GVHMR post-processing (see predict()). 'feet' (default) cleans foot "
+                         "contacts without holding wrists back at the apex of a strike; 'full' is "
+                         "GVHMR's demo behaviour.")
+    ap.add_argument("--smplx-only", action="store_true",
+                    help="write smplx.npz only (skip the 33-landmark export of the legacy lift)")
+    ap.add_argument("--smplx-out", type=Path, default=None,
+                    help="where to write the SMPL-X parameters for retarget_smplx.py "
+                         "(default: smplx.npz — or smplx_<person>.npz — next to --out)")
+    ap.add_argument("--feet-python", default=None,
+                    help="a Python with mediapipe for detect_feet.py (default: this one, else `python` on PATH)")
+    ap.add_argument("--no-refine", action="store_true",
+                    help="skip the 2D-keypoint refinement (refine_smplx.py); the raw GVHMR "
+                         "parameters are always kept beside it as *_raw.npz")
     args = ap.parse_args()
 
     def rp(p: Path) -> Path:
@@ -439,14 +604,43 @@ def main() -> None:
     preflight()
     fps = args.fps or video_fps(video)
 
-    res = run_gvhmr(video, args.person)
+    res = run_gvhmr(video, args.person, args.postproc)
     pred = res["pred"]
-    joints_ayfz, joints_incam, K, face_ayfz, face_incam = smpl_joints(pred)
-    L = joints_ayfz.shape[0]
 
     cap = cv2.VideoCapture(str(video))
     wh = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080)
     cap.release()
+
+    smplx_out = rp(args.smplx_out) if args.smplx_out else out_path.with_name(
+        f"smplx_{args.person}.npz" if args.person else "smplx.npz")
+    raw_out = smplx_out.with_name(smplx_out.stem + "_raw.npz")
+    info = export_smplx(pred, raw_out, fps, wh)
+    print(f"wrote {raw_out} ({info['frames']} frames, performer {info['height_m']} m, "
+          f"postproc {info['postproc']})")
+    if args.no_refine:
+        import shutil
+        shutil.copyfile(raw_out, smplx_out)
+    else:
+        # GVHMR pulls the extremes of fast limbs toward the mean (a kick apex
+        # 0.1-0.2 m low) and says little about feet (COCO-17 stops at the
+        # ankle); fit the pose to the plate's own 2D keypoints, heels and
+        # toe tips included when a foot detector is available.
+        sys.path.insert(0, str(REPO / "pipeline"))
+        import refine_smplx
+        feet = foot_keypoints(video, smplx_out.with_name(
+            f"feet2d_{args.person}.npz" if args.person else "feet2d.npz"), args)
+        refined, st = refine_smplx.refine(dict(np.load(raw_out)), feet2d=feet, log=lambda *_: None)
+        np.savez_compressed(smplx_out, **refined)
+        feet_msg = (f", heel/toe {st['feet_before_cm']:.1f} -> {st['feet_after_cm']:.1f} cm"
+                    if feet is not None else ", no foot keypoints")
+        print(f"wrote {smplx_out} (refined on 2D keypoints: error {st['reproj_before_cm']:.1f} -> "
+              f"{st['reproj_after_cm']:.1f} cm, p95 {st['reproj_p95_before_cm']:.1f} -> "
+              f"{st['reproj_p95_after_cm']:.1f} cm{feet_msg})")
+    if args.smplx_only:
+        return
+
+    joints_ayfz, joints_incam, K, face_ayfz, face_incam = smpl_joints(pred)
+    L = joints_ayfz.shape[0]
 
     frames = []
     for i in range(L):
