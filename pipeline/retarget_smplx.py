@@ -43,12 +43,15 @@ What cannot be copied, and is solved instead
     removes the drift; frames with a planted foot put the lowest sole on
     the floor; flight frames keep the source arc.
   - foot contacts: a foot is planted when the network's contact detector
-    says so, when its sole sits still on the floor, or when it does not
-    move on screen. Planted segments lock flat, or pivot on the ball
-    (heel raised) or briefly on the heel (toes up), with short ramps in
-    and out; a real slide is left to slide.
-  - hands: GVHMR estimates no fingers; they hold a relaxed curl, closing
-    into the rig-validated fist inside the spec's `fists` windows.
+    says so, when its sole sits still on the floor, when it does not move
+    on screen, or when it carries the body alone (the other foot well
+    up). Planted segments lock flat, or pivot on the ball (heel raised) or
+    briefly on the heel (toes up), with short ramps in and out; a real
+    slide is left to slide, and no free foot goes under the floor.
+  - fingers: GVHMR estimates none. detect_hands.py reads each hand on a
+    zoomed crop of the plate; every finger joint bends by the measured
+    angle. Where the detector lost the hand, a relaxed curl, closing into
+    the rig-validated fist inside the spec's `fists` windows.
 """
 
 from __future__ import annotations
@@ -218,6 +221,86 @@ def fist_quats() -> dict:
     return out
 
 
+# MediaPipe hand landmark ids per finger: base (CMC / MCP) to tip
+FINGERS = {"Thumb": (1, 2, 3, 4), "Index": (5, 6, 7, 8), "Middle": (9, 10, 11, 12),
+           "Ring": (13, 14, 15, 16), "Pinky": (17, 18, 19, 20)}
+
+
+def _angle(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    c = np.sum(a * b, -1) / np.maximum(np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1), 1e-9)
+    return np.arccos(np.clip(c, -1.0, 1.0))
+
+
+def hand_flexion(src: dict, rs: dict, min_score: float = 0.5):
+    """Finger joint flexion from the video, per hand (L, R): (T, 5, 3)
+    angles in radians at the destination clock — five fingers in FINGERS
+    order, three joints each (MCP, PIP, DIP; thumb CMC, MCP, IP) — and a
+    (T,) weight: how much to trust them.
+
+    Angles between consecutive bones of MediaPipe's METRIC landmarks,
+    which do not depend on the view. Confident frames only, a running
+    median over them (a hand misread for a frame is not a twitch), gaps
+    interpolated, and the weight falls to zero across gaps longer than a
+    few frames — there the spec's fists and the relaxed curl take over.
+    None without detect_hands.py output."""
+    if "hands" not in src:
+        return None
+    world = np.asarray(src["hands"]["world"], dtype=np.float64)
+    score = np.asarray(src["hands"]["score"], dtype=np.float64)
+    n = world.shape[0]
+    u = np.clip(rs["src_frame"] - 1.0, 0, n - 1)
+    out = {}
+    for k, side in enumerate(("L", "R")):
+        ok = score[:, k] >= min_score
+        idx = np.nonzero(ok)[0]
+        if len(idx) < 5:
+            continue
+        W = world[:, k]
+        ang = np.zeros((n, 5, 3))
+        for f, (a, b, c, d) in enumerate(FINGERS.values()):
+            base = W[:, a] - W[:, 0]
+            s1, s2, s3 = W[:, b] - W[:, a], W[:, c] - W[:, b], W[:, d] - W[:, c]
+            ang[:, f] = np.stack([_angle(base, s1), _angle(s1, s2), _angle(s2, s3)], 1)
+        sm = np.empty_like(ang)
+        good = ang[idx]
+        med = np.stack([np.median(good[max(0, i - 2):i + 3], axis=0) for i in range(len(idx))])
+        for f in range(5):
+            for j in range(3):
+                sm[:, f, j] = gaussian_smooth(np.interp(np.arange(n), idx, med[:, f, j]), 1.0)
+        i0 = np.floor(u).astype(int)
+        i1 = np.minimum(i0 + 1, n - 1)
+        w = (u - i0)[:, None, None]
+        weight = gaussian_smooth(ok.astype(float), 1.5)
+        out[side] = (sm[i0] * (1 - w) + sm[i1] * w, np.interp(u, np.arange(n), weight))
+    return out or None
+
+
+def finger_quats(flex: np.ndarray, fists: dict, side: str) -> dict:
+    """Local rotations of one hand's finger bones from its flexion angles
+    (T, 5, 3). Fingers bend about the axis of the rig-validated fist (the
+    bone's local +X on Mixamo skeletons), each joint capped a little past
+    the fist's own angle. The thumb's fist folds on a mix of axes: it
+    follows a single curl, its MCP and IP flexion over the fist's."""
+    pre = "Left" if side == "L" else "Right"
+    T = flex.shape[0]
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    out = {}
+    for f, name in enumerate(FINGERS):
+        fq = [np.asarray(fists[f"{pre}Hand{name}{j}"], dtype=np.float64) for j in (1, 2, 3)]
+        fq = [q / np.linalg.norm(q) for q in fq]
+        fist_ang = [2.0 * np.arccos(np.clip(q[0], -1.0, 1.0)) for q in fq]
+        if name == "Thumb":
+            curl = np.clip((flex[:, f, 1] + flex[:, f, 2]) / (fist_ang[1] + fist_ang[2]), 0.0, 1.0)
+            for j in range(3):
+                out[f"{pre}Hand{name}{j + 1}"] = SB.slerp(ident, np.tile(fq[j], (T, 1)), curl)
+            continue
+        for j in range(3):
+            axis = fq[j][1:] / max(np.linalg.norm(fq[j][1:]), 1e-9)
+            a = np.clip(flex[:, f, j], 0.0, 1.15 * fist_ang[j])
+            out[f"{pre}Hand{name}{j + 1}"] = np.concatenate([np.cos(a / 2)[:, None], np.sin(a / 2)[:, None] * axis], 1)
+    return out
+
+
 def window_amount(frames_src: np.ndarray, rise, fall) -> np.ndarray:
     """0 -> 1 over `rise` (src frames), 1 -> 0 over `fall`, smooth edges."""
     up = smootherstep((frames_src - rise[0]) / max(1e-6, rise[1] - rise[0]))
@@ -232,6 +315,11 @@ def load_source(path: Path) -> dict:
     z = np.load(path, allow_pickle=False)
     src = {k: z[k] for k in z.files}
     src["foot"] = json.loads(str(src["foot"]))
+    hands = path.with_name("hands2d.npz")           # detect_hands.py
+    if hands.exists():
+        h = np.load(hands)
+        if h["world"].shape[0] == src["body_pose"].shape[0]:
+            src["hands"] = {"world": h["world"], "score": h["score"]}
     return src
 
 
@@ -342,40 +430,107 @@ def ramp_weights(segs, T: int, ramp: int, select=None):
     return w, owner
 
 
+def median_track(p: np.ndarray, conf: np.ndarray, min_conf: float, r: int = 2) -> np.ndarray:
+    """Running median of a 2D keypoint track over its confident frames
+    (window 2r+1), NaN elsewhere: a keypoint that jumps for a frame or two
+    (MediaPipe swapping feet mid-turn, a detector glitch) does not become a
+    fast foot."""
+    n = len(p)
+    out = np.full((n, 2), np.nan)
+    good = conf >= min_conf
+    for t in np.nonzero(good)[0]:
+        a, b = max(0, t - r), min(n, t + r + 1)
+        g = good[a:b]
+        if g.sum() >= 2:
+            out[t] = np.median(p[a:b][g], axis=0)
+    return out
+
+
 def still_in_image(src: dict, rs: dict, still_px: float, min_conf: float = 0.5):
     """(T, 2) bool per foot (L, R) at the destination clock: the foot does
     not move ON SCREEN. The camera is static, so a foot still in the image
     is still in the world — the most direct contact evidence there is, and
     independent of GVHMR's contact flag and of the 3D fit (both of which
-    can move a foot the video shows planted). Uses the ankle (ViTPose) and,
-    when detect_feet.py ran, the heel and toe tip (MediaPipe): the median
-    speed of the confident points, in pixels per second."""
+    can move a foot the video shows planted). The median speed, in pixels
+    per second, of ViTPose's ankle and — when detect_feet.py ran —
+    MediaPipe's heel and toe tip, on median-filtered tracks.
+
+    Tried and dropped: counting a foot as down when only its ball or heel
+    is still (a pivot). It merged a kung-fu stance with the next one across
+    a turn on the heel and cost leg accuracy, for no gain on the spin
+    plate, whose pivots single_support() already covers."""
     fps = float(src["fps"])
     kp = np.asarray(src["kp2d"], dtype=np.float64)
-    pts = {"L": [kp[:, 15]], "R": [kp[:, 16]]}
-    if "feet2d" in src:
-        f2 = np.asarray(src["feet2d"], dtype=np.float64)
-        pts["L"] += [f2[:, 0], f2[:, 1]]
-        pts["R"] += [f2[:, 2], f2[:, 3]]
     n = kp.shape[0]
-    out = np.zeros((rs["n"], 2), dtype=bool)
     u = np.clip(np.round(rs["src_frame"] - 1.0).astype(int), 0, n - 1)
-    for k, side in enumerate(("L", "R")):
-        speeds = []
-        for p in pts[side]:
-            v = np.zeros(n)
-            v[1:] = np.linalg.norm(np.diff(p[:, :2], axis=0), axis=1) * fps
-            ok = np.minimum(p[:, 2], np.r_[p[:1, 2], p[:-1, 2]]) >= min_conf
-            speeds.append(np.where(ok, v, np.nan))
-        sp = np.nanmedian(np.stack(speeds, 1), axis=1)
-        sp = np.where(np.isnan(sp), np.inf, sp)
-        sp = np.minimum(sp, 1e6)
-        sp = gaussian_smooth(sp, 1.0)
-        out[:, k] = sp[u] < still_px
+    out = np.zeros((rs["n"], 2), dtype=bool)
+
+    def speed(x):
+        v = np.full(n, np.nan)
+        v[1:] = np.linalg.norm(np.diff(x, axis=0), axis=1) * fps
+        return gaussian_smooth(np.where(np.isnan(v), 1e6, v), 1.0)
+
+    for k in range(2):
+        tracks = [kp[:, 15 + k]]
+        if "feet2d" in src:
+            f2 = np.asarray(src["feet2d"], dtype=np.float64)
+            tracks += [f2[:, 2 * k], f2[:, 2 * k + 1]]
+        speeds = [speed(median_track(t[:, :2], t[:, 2], min_conf)) for t in tracks]
+        out[:, k] = np.median(np.stack(speeds, 1), axis=1)[u] < still_px
     return out
 
 
-def source_contacts(Ps, Rs, rj, foot, static, fps, opts, floor_known=False, still2d=None):
+def floor_envelope(h: np.ndarray, fps: float, half_s: float = 1.5) -> np.ndarray:
+    """The floor under a height track that drifts slowly: the lowest value
+    within +-`half_s` seconds (a jump or a kick lasts less than that)."""
+    w = max(1, int(round(half_s * fps)))
+    return np.array([h[max(0, t - w):t + w + 1].min() for t in range(len(h))])
+
+
+def single_support(local, transl, rj, foot, fps, opts, lift=None):
+    """The foot that carries the body alone, and the joints to pin for it.
+
+    One foot well above the other (a kick, a knee, a step) means the lower
+    one is standing, whatever the network's contact flag says and however
+    it slides in the world track: through the spin plate's kicks GVHMR
+    slides the support foot at up to 2 m/s while the video shows it fixed,
+    pivoting on the ball. Not when the lower foot is off the floor itself
+    (a jump): the floor is the lower envelope of the lower foot's height,
+    which follows the world track's slow vertical drift (`lift`, the
+    camera's height correction, removes most of it).
+
+    Returns (T, 4) pin weights in static_conf order (L ankle, L ball,
+    R ankle, R ball) — the ball alone when the heel is up (the foot turns
+    about it) — and (T, 2) bool per foot.
+    """
+    P, R = SB.fk_local(local, transl, rj)
+    if lift is not None:
+        P = P + np.asarray(lift, dtype=np.float64)[:, None, None] * np.array([0.0, 1.0, 0.0])
+    T = P.shape[0]
+    low, heel_h, ball_h = {}, {}, {}
+    for side, (_, _, ank, ball) in LEGS.items():
+        f = foot[side]
+
+        def att(j, pt):
+            return P[:, j] + np.einsum("tij,j->ti", R[:, j], np.asarray(pt, dtype=np.float64) - rj[j])
+        heel_h[side] = att(ank, [rj[ank, 0], f["sole_y"], rj[ank, 2]])[:, 1]
+        ball_h[side] = np.minimum(att(ank, [rj[ball, 0], f["sole_y"], rj[ball, 2]])[:, 1],
+                                  att(ball, [rj[ball, 0], f["sole_y"], f["toe_tip_z"]])[:, 1])
+        low[side] = np.minimum(heel_h[side], ball_h[side])
+    floor = floor_envelope(np.minimum(low["L"], low["R"]), fps)
+    swing, near = float(opts["contact_swing_height"]), float(opts["contact_support_height"])
+    weights = np.zeros((T, 4))
+    support = np.zeros((T, 2), dtype=bool)
+    for k, (side, other) in enumerate((("L", "R"), ("R", "L"))):
+        on = clean_mask((low[other] - low[side] > swing) & (low[side] - floor < near), 3, 2)
+        support[:, k] = on
+        heel_up = heel_h[side] - ball_h[side] > 0.02
+        weights[:, 2 * k] = (on & ~heel_up).astype(float)
+        weights[:, 2 * k + 1] = on.astype(float)
+    return weights, support
+
+
+def source_contacts(Ps, Rs, rj, foot, static, fps, opts, floor_known=False, still2d=None, support=None):
     """When is each foot planted? GVHMR's own contact detector, CHECKED
     against the geometry.
 
@@ -394,6 +549,11 @@ def source_contacts(Ps, Rs, rj, foot, static, fps, opts, floor_known=False, stil
     network says. On the spin plate the network's confidence stays under
     0.4 for 200 frames of turning footwork with the feet on the floor.
 
+    A foot still on screen is planted when its sole is within
+    `contact_still_height` of the floor (the estimate can leave a planted
+    foot 6-9 cm up, the spin plate's landing), and a single-support foot
+    (`single_support`) is planted, full stop.
+
     Returns per foot the heel and ball masks, plus the lowest source sole
     per frame (the grounding reference).
     """
@@ -411,6 +571,10 @@ def source_contacts(Ps, Rs, rj, foot, static, fps, opts, floor_known=False, stil
                      "ball": attached(ank, [rj[ball, 0], f["sole_y"], rj[ball, 2]]),
                      "tip": attached(ball, [rj[ball, 0], f["sole_y"], f["toe_tip_z"]])}
     low = np.min(np.stack([p[:, 1] for side in pts for p in pts[side].values()], 1), 1)
+    # heights above the floor for the image's evidence: the known floor, or
+    # before it is known the lower envelope of the lowest sole (the height
+    # track is camera-true, so it drifts little)
+    floor = np.zeros(len(low)) if floor_known else floor_envelope(low, fps)
 
     def speed(x):
         v = np.zeros(len(x))
@@ -437,7 +601,10 @@ def source_contacts(Ps, Rs, rj, foot, static, fps, opts, floor_known=False, stil
                  & (np.minimum(heel_h, ball_h) < hmax))
         if still2d is not None:
             # still on screen and low: planted, whatever the 3D track says
-            still |= still2d[:, 0 if side == "L" else 1] & (np.minimum(heel_h, ball_h) < hmax)
+            sole = np.minimum(pts[side]["heel"][:, 1], np.minimum(pts[side]["ball"][:, 1], pts[side]["tip"][:, 1]))
+            still |= still2d[:, 0 if side == "L" else 1] & (sole - floor < float(opts["contact_still_height"]))
+        if support is not None:
+            still |= support[:, 0 if side == "L" else 1]
         if floor_known:
             g_h, g_v = float(opts["contact_geo_height"]), float(opts["contact_geo_speed"])
             heel_c |= (pts[side]["heel"][:, 1] < g_h) & (v_heel < g_v)
@@ -473,6 +640,69 @@ def camera_drift(src, rj, rs, R_c2w, t_c2w, Ry, opts):
     pw = rj[0] + rs["transl"]                               # world pelvis (after pin_static_feet)
     d = np.einsum("ij,tj->ti", R_c2w, pc) + t_c2w - pw
     return np.einsum("ij,tj->ti", Ry, d)
+
+
+def foot_tilt_bias(local, rj, static, max_deg: float = 12.0, min_frames: int = 10):
+    """Per foot (L, R), the constant local rotation that lays GVHMR's foot
+    flat when it stands still: its median tilt, pitch and roll, over the
+    frames the network calls the whole foot static (ankle and ball > 0.8).
+
+    GVHMR's feet stand 0-10 degrees toes-up and rolled a few degrees on the
+    five plates, differently per foot but steadily through a take. A flat
+    lock lays the foot flat anyway; the bias then shows twice: a
+    4-frame flap as each lock ramps in and out, and a toes-up swing foot.
+    Removing the take's own bias from every frame fixes both. Capped at
+    `max_deg`; identity with too few static frames."""
+    _, R = SB.fk_local(local, np.zeros((local.shape[0], 3)), rj)
+    out = {}
+    for side, (ank, (ca, cb)) in (("L", (7, STATIC["L"])), ("R", (8, STATIC["R"]))):
+        still = (static[:, ca] > 0.8) & (static[:, cb] > 0.8)
+        if still.sum() < min_frames:
+            out[side] = np.eye(3)
+            continue
+        up_local = np.einsum("tji,j->ti", R[still, ank], [0.0, 1.0, 0.0])     # world up, in the foot's frame
+        m = np.median(up_local, axis=0)
+        m /= np.linalg.norm(m)
+        C = SB.align_rotation(np.array([0.0, 1.0, 0.0]), m)
+        ang = np.degrees(np.arccos(np.clip(m[1], -1.0, 1.0)))
+        if ang > max_deg:                                  # keep the direction, cap the size
+            C = SB.align_rotation(np.array([0.0, 1.0, 0.0]),
+                                  np.array([0.0, 1.0, 0.0]) * np.cos(np.radians(max_deg))
+                                  + (m - np.array([0.0, m[1], 0.0])) / max(np.linalg.norm(m - np.array([0.0, m[1], 0.0])), 1e-9)
+                                  * np.sin(np.radians(max_deg)))
+        out[side] = C
+    return out
+
+
+def image_anchor(src, side, frames_src, cam_pos, R_cam, K, ankle_y, min_conf=0.7, max_spread_px=12.0):
+    """Where the video puts a planted foot: the camera ray through the
+    detected ankle (ViTPose, median over the lock's frames), met by the
+    horizontal plane at the performer's ankle height above the floor, in
+    the rig's armature space. None when the ankle is not seen well or
+    moves on screen (not a planted foot to anchor).
+
+    Opt-in (`contact_image_anchor`): flat locks move across the line of
+    sight to where the plate shows the ankle, capped, and only as far as
+    the leg reaches without lowering the hips more than 1.5 cm. It puts
+    planted feet exactly on the performer's in the overlay, but a rig with
+    wider hips than the performer (the Y Bot) must then angle its legs
+    away from the video's: leg angles came out 0.3 deg better on two plates
+    and 0.2-0.6 deg worse on three."""
+    kp = np.asarray(src["kp2d"], dtype=np.float64)
+    n = kp.shape[0]
+    fr = np.unique(np.clip(np.round(np.asarray(frames_src) - 1.0).astype(int), 0, n - 1))
+    a = kp[fr, 15 if side == "L" else 16]
+    a = a[a[:, 2] >= min_conf]
+    if len(a) < 5:
+        return None
+    uv = np.median(a[:, :2], axis=0)
+    if np.median(np.linalg.norm(a[:, :2] - uv, axis=1)) > max_spread_px:
+        return None
+    ray = R_cam @ np.array([(uv[0] - K[0, 2]) / K[0, 0], (uv[1] - K[1, 2]) / K[1, 1], 1.0])
+    if ray[1] > -1e-6:                             # looking up: no floor down there
+        return None
+    t = (ankle_y - cam_pos[1]) / ray[1]
+    return cam_pos + t * ray if t > 0 else None
 
 
 def pin_static_feet(local, transl, rj, static):
@@ -613,9 +843,20 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
 
     # -- 1. source FK, heading + origin normalisation ------------------------
     n_src = src["global_orient"].shape[0]
+    foot = src["foot"]
+    # GVHMR's steady foot tilt, removed from every frame (feet stand flat)
+    tilt = foot_tilt_bias(rs["local"], rj, rs["static"]) if opts.get("foot_tilt_fix", True) else {}
+    for side, C in tilt.items():
+        j = 7 if side == "L" else 8
+        rs["local"][:, j] = rs["local"][:, j] @ C
+    R_c2w, t_c2w = static_camera(src, rj, slice(0, max(2, min(n_src, int(opts["camera_fit_frames"])))))
+    use_cam = bool(opts.get("camera_root", True))
     still2d = still_in_image(src, rs, float(opts["contact_still_px"]))
+    # the camera's height correction does not depend on horizontal pinning
+    lift = camera_drift(src, rj, rs, R_c2w, t_c2w, np.eye(3), opts)[:, 1] if use_cam else None
+    sup_w, support = single_support(rs["local"], rs["transl"], rj, foot, dst_fps, opts, lift)
     if opts.get("pin_static_feet", True):
-        pin_w = np.maximum(rs["static"][:, :4], np.repeat(still2d.astype(float), 2, axis=1))
+        pin_w = np.maximum(np.maximum(rs["static"][:, :4], np.repeat(still2d.astype(float), 2, axis=1)), sup_w)
         rs["transl"] = pin_static_feet(rs["local"], rs["transl"], rj, pin_w)
     Ps, Rs = SB.fk_local(rs["local"], rs["transl"], rj)
     h0 = float(SB.heading(Rs[0, 0]))
@@ -623,20 +864,17 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     origin = np.array([Ps[0, 0, 0], 0.0, Ps[0, 0, 2]])
     Ps = np.einsum("ij,tkj->tki", Ry, Ps - origin)
     Rs = np.einsum("ij,tkjl->tkil", Ry, Rs)
-    foot = src["foot"]
     src_floor_rest = min(foot["L"]["sole_y"], foot["R"]["sole_y"])
     static = rs["static"]
 
     # -- 2. camera-consistent trajectory, contacts, floor ---------------------
-    R_c2w, t_c2w = static_camera(src, rj, slice(0, max(2, min(n_src, int(opts["camera_fit_frames"])))))
-    use_cam = bool(opts.get("camera_root", True))
     d_cam = camera_drift(src, rj, rs, R_c2w, t_c2w, Ry, opts) if use_cam else np.zeros((T, 3))
     # Height: the camera sees it directly (image row x depth), so GVHMR's
     # vertical drift is removed continuously — it moves no foot sideways.
     Ps[:, :, 1] += d_cam[:, 1:2]
     # Floor: on every frame a foot is planted (network + geometry), the
     # lowest sole goes on the floor; flight keeps the (camera-true) arc.
-    contacts, low_src = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, still2d=still2d)
+    contacts, low_src = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, still2d=still2d, support=support)
     grounded = contacts["L"]["any"] | contacts["R"]["any"]
     if grounded.sum() >= 2:
         idx = np.nonzero(grounded)[0]
@@ -646,7 +884,8 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     Ps[:, :, 1] += g[:, None]
     # Second contact pass against the now-known floor: a sole on the floor
     # that does not move is planted, whatever the network says.
-    contacts, _ = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, floor_known=True, still2d=still2d)
+    contacts, _ = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, floor_known=True, still2d=still2d,
+                                  support=support)
     contacts = bridge_contacts(contacts, Ps)
     grounded = contacts["L"]["any"] | contacts["R"]["any"]
     if use_cam:
@@ -677,6 +916,12 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     if spec.get("fists"):
         fist_amt = window_amount(src_frames, spec["fists"]["rise_src"], spec["fists"]["fall_src"])
     hand_amt = np.maximum(float(opts["hand_relaxed"]), fist_amt)
+    # fingers from the video where the hand detector saw them
+    flex = hand_flexion(src, rs) if opts.get("hand_detect", True) else None
+    seen = {}
+    for side_, (fl, wt) in (flex or {}).items():
+        for bone, q in finger_quats(fl, fists, side_).items():
+            seen[bone] = (q, wt)
     P = np.empty((T, B, 3, 3))
     bone_joint = {b: j for j, b in rig.joint_bone.items()}
     for i in range(B):
@@ -689,6 +934,8 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
             if short in fists:
                 fq = np.asarray(fists[short], dtype=np.float64)
                 qt = SB.slerp(np.tile([1.0, 0, 0, 0], (T, 1)), np.tile(fq / np.linalg.norm(fq), (T, 1)), hand_amt)
+                if short in seen:
+                    qt = SB.slerp(qt, seen[short][0], seen[short][1])
                 local = SB.quat_to_matrix(qt)
             P[:, i] = (P[:, p] if p >= 0 else np.eye(3)) @ rig.rest_rel[i] @ local
 
@@ -791,6 +1038,15 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         pull = np.full(T, -low.min())
     root[:, 1] += pull
     pos = rig.chain_positions(P, root)
+    # The plate's camera in the rig's (scaled, grounded) armature space:
+    # static, placed where frame 1 puts the body relative to it.
+    C = Ry @ (t_c2w - origin) + cam_corr[0]
+    C[1] += g[0] + d_cam[0, 1]
+    R_cam = Ry @ R_c2w                              # OpenCV camera axes -> normalised source world
+    cam_pos_arm = C * s
+    cam_pos_arm[1] += rig.floor + tgt_hips_h - s * src_pelvis_h + pull[0]
+    cam_pos_arm[[0, 2]] += rig.head[rig.root][[0, 2]]
+    K_src = np.asarray(src["K"], dtype=np.float64)
 
     ramp = int(opts["contact_ramp"])
     contact_report = {}
@@ -829,6 +1085,13 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
                                                  np.array([rj[ball_j, 0], f_src["sole_y"], rj[ball_j, 2]]) - rj[ank_j])}
         max_drift = float(opts["contact_max_drift"])
         slide_v = float(opts["contact_slide_speed"])
+        # the heading of the source foot laid flat (a foot rolled onto its
+        # edge keeps the direction it points in; its tilted axis does not)
+        R_lay = SB.align_rotation(np.einsum("tij,j->ti", Rs[:, ank_j], [0.0, 1.0, 0.0]),
+                                  np.tile([0.0, 1.0, 0.0], (T, 1))) @ Rs[:, ank_j]
+        lay_yaw = np.unwrap(SB.heading(R_lay))
+        yaw_s = gaussian_smooth(lay_yaw, 2.0)
+        max_turn = np.radians(float(opts["contact_max_turn_deg"]))
         segs, flat, on_heel, parent = [], [], [], []
         for k0, ((a_, b_), fl, oh) in enumerate(zip(segs0, flat0, heel0)):
             ref = refs["ankle" if fl else "heel" if oh else "ball"][:, [0, 2]]
@@ -841,12 +1104,18 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
             # follows the source there (smoothly), and only the still runs
             # lock. A foot the IMAGE shows still counts as still even when
             # the 3D track creeps.
-            steady = (v < slide_v) | still2d[:, k]
+            steady = (v < slide_v) | still2d[:, k] | support[:, k]
             for a2, b2 in runs(steady[a_:b_ + 1]):
                 a2, b2 = a2 + a_, b2 + a_
                 start, t = a2, a2
                 while t <= b2:
-                    if np.linalg.norm(ref[t] - ref[start]) > max_drift and not still2d[t, k]:
+                    drifted = (np.linalg.norm(ref[t] - ref[start]) > max_drift
+                               and not (still2d[t, k] or support[t, k]))
+                    # A flat foot that turns (a stance pivoting on its heel
+                    # or ball: the ankle barely moves) gets a new heading
+                    # for each piece, instead of one heading for both stances.
+                    turned = fl and abs(yaw_s[t] - yaw_s[start]) > max_turn
+                    if drifted or turned:
                         if t - 1 - start >= 2:
                             segs.append((start, t - 1)); flat.append(fl); on_heel.append(oh); parent.append(k0)
                         start = t
@@ -864,9 +1133,6 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         ha, hb = rig.head[b_ank], rig.head[b_ball]
         yaw_align = foot_yaw[side]
         src_yaw = np.unwrap(SB.heading(Rs[:, ank_j]))
-        R_lay = SB.align_rotation(np.einsum("tij,j->ti", Rs[:, ank_j], [0.0, 1.0, 0.0]),
-                                  np.tile([0.0, 1.0, 0.0], (T, 1))) @ Rs[:, ank_j]
-        lay_yaw = np.unwrap(SB.heading(R_lay))
         seg_yaw = [float(np.median(lay_yaw[a_:b_ + 1])) for a_, b_ in segs]
         flat_w, flat_owner = ramp_weights(segs, T, ramp, lambda k_: flat[k_])
         toe_w, _ = ramp_weights(segs, T, ramp, lambda k_: not on_heel[k_])
@@ -884,8 +1150,11 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         # minus what the root already carries at that frame.
         resid = [s * (np.asarray(deltas[side][parent[k_]])[None, :] - cam_corr[a_:b_ + 1])
                  for k_, (a_, b_) in enumerate(segs)]
-        feet[side] = dict(b_ank=b_ank, b_ball=b_ball, b_hip=rig.joint_bone[hip_j],
-                          b_knee=rig.joint_bone[knee_j], segs=segs, flat=flat, on_heel=on_heel,
+        b_hip_, b_knee_ = rig.joint_bone[hip_j], rig.joint_bone[knee_j]
+        feet[side] = dict(b_ank=b_ank, b_ball=b_ball, b_hip=b_hip_, b_knee=b_knee_,
+                          leg_len=float(np.linalg.norm(rig.head[b_knee_] - rig.head[b_hip_])
+                                        + np.linalg.norm(rig.head[b_ank] - rig.head[b_knee_])),
+                          segs=segs, flat=flat, on_heel=on_heel,
                           ha=ha, hb=hb, w=ramp_weights(segs, T, ramp), resid=resid)
         contact_report[side] = {"segments": len(segs), "flat_segments": int(sum(flat)),
                                 "heel_pivots": int(sum(on_heel)),
@@ -902,10 +1171,48 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         ball_free = rig.attached(P, pos, f["b_ank"], [f["hb"][0], rig.floor, f["hb"][2]])
         f["locks"] = []
         heel_free = rig.attached(P, pos, f["b_ank"], [f["ha"][0], rig.floor, f["ha"][2]])
+        f["anchor_cm"] = []
         for (a_, b_), is_flat, on_heel_, r_ in zip(f["segs"], f["flat"], f["on_heel"], f["resid"]):
             ref = (ankle_free if is_flat else heel_free if on_heel_ else ball_free)[a_:b_ + 1]
             lk = np.median(ref + r_, 0)
             lk[1] = f["ha"][1] if is_flat else rig.floor
+            if is_flat and opts.get("contact_image_anchor", False):
+                d = image_anchor(src, side, src_frames[a_:b_ + 1], cam_pos_arm, R_cam, K_src,
+                                 rig.floor + s * src["foot"][side]["ankle_h"])
+                if d is not None:
+                    shift = d[[0, 2]] - lk[[0, 2]]
+                    # only across the line of sight: along it, the ray meets
+                    # the floor at a grazing 12-19 degrees, and 1 cm of error
+                    # in the ankle's height is 3-4 cm of depth
+                    view = (d - cam_pos_arm)[[0, 2]]
+                    view /= max(float(np.linalg.norm(view)), 1e-9)
+                    shift = shift - np.dot(shift, view) * view
+                    n = float(np.linalg.norm(shift))
+                    cap = float(opts["contact_anchor_max"])
+                    if n > cap:
+                        shift *= cap / n
+                    # ...and only as far as the leg reaches without lowering
+                    # the hips more than 1.5 cm: the rear leg of a kung-fu bow
+                    # stance is straight, and a foot set 5 cm wider there
+                    # dropped the hips to their cap and bent both legs
+                    hips = pos[a_:b_ + 1, f["b_hip"]]
+                    L2 = (0.998 * f["leg_len"]) ** 2
+
+                    def hips_drop(target):
+                        v = target[None] - hips
+                        h2 = v[:, 0] ** 2 + v[:, 2] ** 2
+                        return float(np.max(np.maximum(-v[:, 1] - np.sqrt(np.maximum(L2 - h2, 0.0)), 0.0)))
+                    base = hips_drop(lk)
+                    allowed = min(base + float(opts["contact_anchor_drop"]),
+                                  max(base, float(opts["max_hips_drop"]) - 0.01))
+                    for alpha in (1.0, 0.75, 0.5, 0.25, 0.0):
+                        trial = lk.copy()
+                        trial[[0, 2]] += alpha * shift
+                        if hips_drop(trial) <= allowed:
+                            break
+                    shift = alpha * shift
+                    lk[[0, 2]] += shift
+                    f["anchor_cm"].append(round(float(np.linalg.norm(shift)) * 100, 1))
             f["locks"].append(lk)
 
     def ankle_targets(pos_):
@@ -949,6 +1256,15 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         root[:, 1] -= drop
         pos = rig.chain_positions(P, root)
     tg = ankle_targets(pos)
+    # A free foot the estimate carries under the floor (turning footwork
+    # on the spin plate, 4 cm) is lifted by its own leg, not by the body:
+    # raising the hips for it would float the other foot.
+    for side, f in feet.items():
+        ys = np.min(np.stack([rig.attached(P, pos, b, p)[:, 1] for b, p in tgt_probes[side]], 1), 1)
+        sink = np.maximum(rig.floor - ys - float(opts["sink_tolerance"]), 0.0) * (1.0 - f["w"][0])
+        if sink.any():
+            sink = gaussian_smooth(np.array([sink[max(0, t - 2):t + 3].max() for t in range(T)]), 1.0)
+            tg[side] = tg[side] + sink[:, None] * np.array([0.0, 1.0, 0.0])
     for side in feet:
         solve_leg(side, tg[side])
     pos = rig.chain_positions(P, root)
@@ -1004,13 +1320,7 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     joints_world = to_world(pos_final)
 
     # -- 10. the plate's camera, in the same (scaled, grounded) world --------
-    # the camera stays where it was at frame 1; the body was moved onto it
-    C = Ry @ (t_c2w - origin) + cam_corr[0]
-    C[1] += g[0] + d_cam[0, 1]
-    R_cam = Ry @ R_c2w                              # OpenCV camera axes -> normalised source world
-    cam_pos_arm = C * s
-    cam_pos_arm[1] += rig.floor + tgt_hips_h - s * src_pelvis_h + pull[0]
-    cam_pos_arm[[0, 2]] += rig.head[rig.root][[0, 2]]
+    # (placed in section 7; the camera stays where it was at frame 1)
     R_bl = rig.arm_rot @ R_cam @ np.diag([1.0, -1.0, -1.0])   # Blender camera looks down -Z, +Y up
     cam_mw = np.eye(4)
     cam_mw[:3, :3] = R_bl
@@ -1018,6 +1328,10 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
 
     # -- 11. QA numbers ---------------------------------------------------------
     qa = {"scale": round(s, 4), "frames": T, "ik_clamped_frames": ik_clamped,
+          "single_support_frames": {"L": int(support[:, 0].sum()), "R": int(support[:, 1].sum())},
+          "image_anchor_cm": {side: f.get("anchor_cm", []) for side, f in feet.items()},
+          "foot_tilt_fix_deg": {side: round(float(np.degrees(np.arccos(np.clip((np.trace(C) - 1) / 2, -1, 1)))), 1)
+                                for side, C in tilt.items()},
           "contact_reach_error_cm": reach_err, "hips_drop_cm": round(float(drop.max() * 100), 2),
           "ground_drift_m": [round(float(g.min()), 3), round(float(g.max()), 3)],
           "target_pull_m": [round(float(pull.min()), 3), round(float(pull.max()), 3)],
@@ -1091,7 +1405,10 @@ def main() -> None:
     rig = Rig(json.loads(prof_path.read_text(encoding="utf-8")))
     opts = {"contact_threshold": 0.5, "contact_max_speed": 0.3, "contact_max_height": 0.06,
             "contact_geo_height": 0.025, "contact_geo_speed": 0.2, "contact_heel_height": 0.03,
-            "contact_max_drift": 0.04, "contact_slide_speed": 0.12, "contact_still_px": 15.0, "max_hips_drop": 0.05,
+            "contact_max_drift": 0.04, "contact_slide_speed": 0.12, "contact_still_px": 15.0,
+            "contact_still_height": 0.12, "contact_swing_height": 0.15, "contact_support_height": 0.10,
+            "contact_max_turn_deg": 20.0, "sink_tolerance": 0.01, "contact_anchor_max": 0.12, "contact_anchor_drop": 0.015,
+            "max_hips_drop": 0.05,
             "contact_heel_max_s": 0.5, "ground_sigma": 3.0, "contact_ramp": 4, "hand_relaxed": 0.3,
             "camera_fit_frames": 12, "camera_root": True, "camera_smooth": 5.0}
     opts.update(spec.get("smplx_retarget", {}))

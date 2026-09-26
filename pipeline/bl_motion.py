@@ -314,7 +314,9 @@ def cmd_render(args) -> None:
             a = math.radians(35.0)
             cam.location = Vector((cx + dist * math.sin(a), cy - dist * math.cos(a), 1.55))
             cam.rotation_euler = (math.radians(81.0), 0.0, a)
-    scene.render.resolution_percentage = 100
+    # --scale renders more pixels of the same shot (framing is resolution-
+    # independent): the zoomed hand and foot crops of render_review.py
+    scene.render.resolution_percentage = int(round(100 * args.scale))
     out = rpath(args.out)
     out.mkdir(parents=True, exist_ok=True)
     scene.render.filepath = str(out / "f####")
@@ -342,6 +344,7 @@ def main() -> None:
     r.add_argument("--out", required=True)
     r.add_argument("--frames", help="first:last (1-based, inclusive)")
     r.add_argument("--distance", type=float, default=4.6)
+    r.add_argument("--scale", type=float, default=1.0, help="resolution multiplier (2 = twice the pixels per side)")
     args = ap.parse_args(argv)
     {"dump-rig": dump_rig, "apply": cmd_apply, "render": cmd_render}[args.cmd](args)
 

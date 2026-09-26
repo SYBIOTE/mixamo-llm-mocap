@@ -534,40 +534,44 @@ def project(p: np.ndarray, K: np.ndarray, wh: tuple[int, int]) -> np.ndarray:
     return np.array([u, v, 0.0])
 
 
-def foot_keypoints(video: Path, out: Path, args):
-    """Heel/toe 2D keypoints for the refinement (detect_feet.py, MediaPipe).
+def run_mediapipe(script: str, video: Path, out: Path, args, extra=()) -> bool:
+    """Run one of the MediaPipe detectors (detect_feet.py, detect_hands.py).
 
     MediaPipe does not live in the GVHMR venv, so the detector runs in
     whichever Python has it: this one, --feet-python, or `python` on PATH.
-    Cached next to the plate; returns None (refinement without feet) when
-    no detector is available or the plate has two performers.
-    """
+    Returns whether `out` was written."""
     import importlib.util
     import shutil
     import subprocess
 
-    if out.exists():
-        return np.load(out)["kp"]
-    if args.person:
-        print("foot keypoints: skipped (multi-person plate; MediaPipe tracks one pose)")
-        return None
-    script = REPO / "pipeline" / "detect_feet.py"
     if importlib.util.find_spec("mediapipe") is not None:
         cmd = [sys.executable]
     else:
         exe = args.feet_python or shutil.which("python") or shutil.which("python3")
         cmd = [exe] if exe else None
     if cmd is None:
-        print("foot keypoints: no Python with mediapipe found (pass --feet-python); refining without feet")
-        return None
-    res = subprocess.run(cmd + [str(script), "--video", str(video), "--out", str(out)],
+        print(f"{script}: no Python with mediapipe found (pass --feet-python)")
+        return False
+    res = subprocess.run(cmd + [str(REPO / "pipeline" / script), "--video", str(video), "--out", str(out), *extra],
                          capture_output=True, text=True)
     if res.returncode != 0 or not out.exists():
-        print("foot keypoints: detect_feet.py failed; refining without feet\n" + res.stderr[-800:])
-        return None
+        print(f"{script} failed\n" + res.stderr[-800:])
+        return False
     if res.stdout.strip():
         print(res.stdout.strip().splitlines()[-1])
-    return np.load(out)["kp"]
+    return True
+
+
+def foot_keypoints(video: Path, out: Path, args):
+    """Heel/toe 2D keypoints for the refinement (detect_feet.py). Cached
+    next to the plate; None (refinement without feet) when no detector is
+    available or the plate has two performers."""
+    if out.exists():
+        return np.load(out)["kp"]
+    if args.person:
+        print("foot keypoints: skipped (multi-person plate; MediaPipe tracks one pose)")
+        return None
+    return np.load(out)["kp"] if run_mediapipe("detect_feet.py", video, out, args) else None
 
 
 def main() -> None:
@@ -588,7 +592,8 @@ def main() -> None:
                     help="where to write the SMPL-X parameters for retarget_smplx.py "
                          "(default: smplx.npz — or smplx_<person>.npz — next to --out)")
     ap.add_argument("--feet-python", default=None,
-                    help="a Python with mediapipe for detect_feet.py (default: this one, else `python` on PATH)")
+                    help="a Python with mediapipe for detect_feet.py and detect_hands.py "
+                         "(default: this one, else `python` on PATH)")
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the 2D-keypoint refinement (refine_smplx.py); the raw GVHMR "
                          "parameters are always kept beside it as *_raw.npz")
@@ -636,6 +641,14 @@ def main() -> None:
         print(f"wrote {smplx_out} (refined on 2D keypoints: error {st['reproj_before_cm']:.1f} -> "
               f"{st['reproj_after_cm']:.1f} cm, p95 {st['reproj_p95_before_cm']:.1f} -> "
               f"{st['reproj_p95_after_cm']:.1f} cm{feet_msg})")
+    # Fingers: GVHMR estimates none. detect_hands.py zooms on each wrist of
+    # this estimate and runs a hand detector there; retarget_smplx.py reads
+    # hands2d.npz next to smplx.npz.
+    hands = smplx_out.with_name("hands2d.npz")
+    if args.person:
+        print("hand keypoints: skipped (multi-person plate)")
+    elif not hands.exists():
+        run_mediapipe("detect_hands.py", video, hands, args, ("--kp", str(raw_out)))
     if args.smplx_only:
         return
 
