@@ -45,7 +45,8 @@ What cannot be copied, and is solved instead
   - foot contacts: a foot is planted when the network's contact detector
     says so, when its sole sits still on the floor, when it does not move
     on screen, or when it carries the body alone (the other foot well
-    up); where none of that says which foot is down, the lower one is. Planted segments lock flat, or pivot on the ball (heel raised) or
+    up). Where the body stands and a free foot hovers just above the
+    floor, its leg sets it down (height only). Planted segments lock flat, or pivot on the ball (heel raised) or
     briefly on the heel (toes up), with short ramps in and out; a real
     slide is left to slide, and no free foot goes under the floor.
   - fingers: GVHMR estimates none. detect_hands.py reads each hand on a
@@ -487,17 +488,19 @@ def floor_envelope(h: np.ndarray, fps: float, half_s: float = 1.5) -> np.ndarray
     return np.array([h[max(0, t - w):t + w + 1].min() for t in range(len(h))])
 
 
-def single_support(local, transl, rj, foot, fps, opts, lift=None, evidence=None):
+def single_support(local, transl, rj, foot, fps, opts, lift=None):
     """The foot that carries the body alone, and the joints to pin for it.
 
     One foot well above the other (a kick, a knee, a step) means the lower
     one is standing, whatever the network's contact flag says and however
     it slides in the world track: through the spin plate's kicks GVHMR
     slides the support foot at up to 2 m/s while the video shows it fixed,
-    pivoting on the ball. Not when the lower foot is off the floor itself
-    (a jump): the floor is the lower envelope of the lower foot's height,
-    which follows the world track's slow vertical drift (`lift`, the
-    camera's height correction, removes most of it).
+    pivoting on the ball, and holds the take-off foot of the jump 10-13 cm
+    up. Not when the lower foot is off the floor itself (a jump, 18 cm and
+    up): the floor is the lower envelope of the lower foot's height, which
+    follows the world track's slow vertical drift (`lift`, the camera's
+    height correction, removes most of it). These contacts are inferred:
+    they lock the foot, they do not set the floor's height.
 
     Returns (T, 4) pin weights in static_conf order (L ankle, L ball,
     R ankle, R ball) — the ball alone when the heel is up (the foot turns
@@ -519,29 +522,10 @@ def single_support(local, transl, rj, foot, fps, opts, lift=None, evidence=None)
         low[side] = np.minimum(heel_h[side], ball_h[side])
     floor = floor_envelope(np.minimum(low["L"], low["R"]), fps)
     swing, near = float(opts["contact_swing_height"]), float(opts["contact_support_height"])
-    # Where nothing else says a foot is down (`evidence`: the network's
-    # flag, a foot still on screen), the lower foot is, while the body is
-    # not in the air (`contact_lower_foot`) — with a little hysteresis so
-    # two feet at one height do not flicker. The legacy lift did this through
-    # the spin plate's turning footwork, and its feet stayed on the floor
-    # where this retarget's floated 3 cm. Everywhere, it cost leg accuracy
-    # (the other evidence already plants those feet, better).
-    hyst = float(opts["contact_switch_height"])
-    lower = np.zeros(T, dtype=int)                     # 0 = L, 1 = R
-    for t in range(T):
-        prev = lower[t - 1] if t else int(low["R"][0] < low["L"][0])
-        cur, oth = (low["L"][t], low["R"][t]) if prev == 0 else (low["R"][t], low["L"][t])
-        lower[t] = prev if cur <= oth + hyst else 1 - prev
-    grounded = np.minimum(low["L"], low["R"]) - floor < near
-    if evidence is not None:
-        grounded &= ~evidence
     weights = np.zeros((T, 4))
     support = np.zeros((T, 2), dtype=bool)
     for k, (side, other) in enumerate((("L", "R"), ("R", "L"))):
-        on = (low[other] - low[side] > swing) & (low[side] - floor < near)
-        if opts.get("contact_lower_foot", True):
-            on |= grounded & (lower == k)
-        on = clean_mask(on, 3, 2)
+        on = clean_mask((low[other] - low[side] > swing) & (low[side] - floor < near), 3, 2)
         support[:, k] = on
         heel_up = heel_h[side] - ball_h[side] > 0.02
         weights[:, 2 * k] = (on & ~heel_up).astype(float)
@@ -873,10 +857,7 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     still2d = still_in_image(src, rs, float(opts["contact_still_px"]))
     # the camera's height correction does not depend on horizontal pinning
     lift = camera_drift(src, rj, rs, R_c2w, t_c2w, np.eye(3), opts)[:, 1] if use_cam else None
-    # frames where the network or the image already puts a foot down
-    evidence = (rs["static"][:, :4].max(1) > float(opts["contact_threshold"])) | still2d.any(1)
-    sup_w, support = single_support(rs["local"], rs["transl"], rj, foot, dst_fps, opts, lift,
-                                    evidence=clean_mask(evidence, 1, 3))
+    sup_w, support = single_support(rs["local"], rs["transl"], rj, foot, dst_fps, opts, lift)
     if opts.get("pin_static_feet", True):
         pin_w = np.maximum(np.maximum(rs["static"][:, :4], np.repeat(still2d.astype(float), 2, axis=1)), sup_w)
         pinned = pin_static_feet(rs["local"], rs["transl"], rj, pin_w)
@@ -902,7 +883,20 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     Ps[:, :, 1] += d_cam[:, 1:2]
     # Floor: on every frame a foot is planted (network + geometry), the
     # lowest sole goes on the floor; flight keeps the (camera-true) arc.
-    contacts, low_src = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, still2d=still2d, support=support)
+    # Contacts that SET the floor's height are the observed ones only: a
+    # single-support foot is inferred, and the estimate can hold it 10-13 cm
+    # up (spin take-off) — grounding on it would lower the whole body (and
+    # the jump that follows) below where the camera sees it. Its leg reaches
+    # the floor instead (the lock, below).
+    contacts, low_src = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, still2d=still2d)
+    # The body stands (it is not in the air) while its lower sole is within
+    # `contact_support_height` of the floor under it — camera-true heights,
+    # so that envelope drifts little. Used to set down feet hovering just
+    # above the floor (the final leg solve), NOT to ground the body: putting
+    # the lower foot on the floor on every such frame moved the body off the
+    # plate's camera (spin jump 10 px low, feet pulled onto an estimate that
+    # holds the wrong one down).
+    on_floor = low_src - floor_envelope(low_src, dst_fps) < float(opts["contact_support_height"])
     grounded = contacts["L"]["any"] | contacts["R"]["any"]
     if grounded.sum() >= 2:
         idx = np.nonzero(grounded)[0]
@@ -912,10 +906,12 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
     Ps[:, :, 1] += g[:, None]
     # Second contact pass against the now-known floor: a sole on the floor
     # that does not move is planted, whatever the network says.
+    observed, _ = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, floor_known=True, still2d=still2d)
     contacts, _ = source_contacts(Ps, Rs, rj, foot, static, dst_fps, opts, floor_known=True, still2d=still2d,
                                   support=support)
     contacts = bridge_contacts(contacts, Ps)
     grounded = contacts["L"]["any"] | contacts["R"]["any"]
+    grounded_obs = grounded & ~(support.any(1) & ~(observed["L"]["any"] | observed["R"]["any"]))
     if use_cam:
         cam_corr, deltas = camera_footfalls(d_cam, contacts, opts)
     else:
@@ -1059,8 +1055,8 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         return np.min(np.stack(ys, 1), 1)
 
     low = lowest(pos)
-    if grounded.sum() >= 2:
-        idx = np.nonzero(grounded)[0]
+    if grounded_obs.sum() >= 2:
+        idx = np.nonzero(grounded_obs)[0]
         pull = gaussian_smooth(np.interp(np.arange(T), idx, -low[idx]), 2.0)
     else:
         pull = np.full(T, -low.min())
@@ -1293,6 +1289,16 @@ def retarget(spec: dict, src: dict, rig: Rig, opts: dict) -> dict:
         if sink.any():
             sink = gaussian_smooth(np.array([sink[max(0, t - 2):t + 3].max() for t in range(T)]), 1.0)
             tg[side] = tg[side] + sink[:, None] * np.array([0.0, 1.0, 0.0])
+        # A free foot hovering just above the floor while the body stands
+        # (turning footwork: the estimate lifts one foot 3-6 cm the video
+        # shows down) is set on it by its own leg — height only, it is not
+        # locked anywhere. Fades out between 2 and 6 cm, so a foot lifting
+        # off is not held.
+        if opts.get("floor_snap", True):
+            gap = ys - rig.floor
+            wsnap = np.clip((float(opts["floor_snap_height"]) - gap) / (float(opts["floor_snap_height"]) - 0.02), 0.0, 1.0)
+            wsnap = gaussian_smooth(wsnap * (gap > 0) * on_floor * (1.0 - f["w"][0]), 1.0)
+            tg[side] = tg[side] - (gap * wsnap)[:, None] * np.array([0.0, 1.0, 0.0])
     for side in feet:
         solve_leg(side, tg[side])
     pos = rig.chain_positions(P, root)
@@ -1434,8 +1440,8 @@ def main() -> None:
     opts = {"contact_threshold": 0.5, "contact_max_speed": 0.3, "contact_max_height": 0.06,
             "contact_geo_height": 0.025, "contact_geo_speed": 0.2, "contact_heel_height": 0.03,
             "contact_max_drift": 0.04, "contact_slide_speed": 0.12, "contact_still_px": 15.0,
-            "contact_still_height": 0.12, "contact_swing_height": 0.15, "contact_support_height": 0.10,
-            "contact_max_turn_deg": 20.0, "contact_switch_height": 0.02, "pin_smooth": 1.0, "sink_tolerance": 0.01, "contact_anchor_max": 0.12, "contact_anchor_drop": 0.015,
+            "contact_still_height": 0.12, "contact_swing_height": 0.15, "contact_support_height": 0.14,
+            "contact_max_turn_deg": 20.0, "floor_snap_height": 0.06, "pin_smooth": 1.0, "sink_tolerance": 0.01, "contact_anchor_max": 0.12, "contact_anchor_drop": 0.015,
             "max_hips_drop": 0.05,
             "contact_heel_max_s": 0.5, "ground_sigma": 3.0, "contact_ramp": 4, "hand_relaxed": 0.3,
             "camera_fit_frames": 12, "camera_root": True, "camera_smooth": 5.0}
