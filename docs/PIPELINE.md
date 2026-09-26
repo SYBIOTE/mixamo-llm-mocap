@@ -118,15 +118,15 @@ What the stage does, in order:
    tracks, sole within 12 cm of the floor — the estimate can leave a
    planted foot 6–9 cm up; the camera is static, so still in the image is
    still in the world), and **single support**: when one foot is more than
-   15 cm above the other and the lower one is within 10 cm of the floor,
+   15 cm above the other and the lower one is within 14 cm of the floor,
    the lower one carries the body — through the spin plate's kicks GVHMR
-   slides it at up to 2 m/s while the video shows it fixed. And where
-   nothing else plants a foot (no network flag, nothing still on screen)
-   and the body is not in the air, the **lower foot** does, with 2 cm of
-   hysteresis between the feet — the legacy lift's rule through the spin
-   plate's turning footwork, where this retarget's feet otherwise floated
-   3 cm. Runs of the same foot separated by a confidence dip, with the
-   foot unmoved, are joined.
+   slides it at up to 2 m/s while the video shows it fixed, and it holds
+   the jump's take-off foot 10–13 cm up. Only observed contacts (network,
+   image, floor) set the floor's height: an inferred support locks its
+   foot, and its leg reaches down, but grounding on it would lower the
+   whole body — and the jump after it — below where the camera sees it.
+   Runs of the same foot separated by a confidence dip, with the foot
+   unmoved, are joined.
 4. **Planted feet stay put**: where a foot is flagged (network, image, or
    single support), the body's horizontal translation absorbs the foot's
    motion (GVHMR's own rule, re-applied on the refined pose, anchored on
@@ -166,7 +166,10 @@ What the stage does, in order:
    lock a leg cannot reach lowers the hips, at most 5 cm. A free foot the
    estimate carries more than 1 cm under the floor is lifted by its own
    leg (`sink_tolerance`: a toe grazing the floor is left alone — lifting
-   it bends the knee away from the video).
+   it bends the knee away from the video); one hovering less than 6 cm
+   above it while the body stands is set down by its leg, height only
+   (`floor_snap`: the estimate lifts a foot the video shows down through
+   turning footwork).
 10. **Fingers** from `hands2d.npz`: per finger joint, the angle between
     consecutive bones of MediaPipe's metric landmarks (view-independent),
     median-filtered over confident frames and smoothed; each Mixamo
@@ -184,8 +187,8 @@ What the stage does, in order:
 `contact_slide_speed` 0.12 m/s, `contact_max_drift` 0.04 m,
 `contact_heel_max_s` 0.5 s, `contact_still_height` 0.12 m,
 `contact_swing_height` 0.15 m, `contact_support_height` 0.10 m,
-`contact_max_turn_deg` 20, `contact_lower_foot` true, `contact_switch_height`
-0.02 m, `pin_smooth` 1, `sink_tolerance` 0.01 m, `foot_tilt_fix` true,
+`contact_max_turn_deg` 20, `contact_support_height` 0.14 m, `floor_snap` true,
+`floor_snap_height` 0.06 m, `pin_smooth` 1, `sink_tolerance` 0.01 m, `foot_tilt_fix` true,
 `contact_image_anchor` false (with `contact_anchor_max` 0.12 m,
 `contact_anchor_drop` 0.015 m), `contact_ramp` 4, `max_hips_drop` 0.05 m,
 `ground_sigma` 3, `hand_relaxed` 0.3, `hand_detect` true, `pin_static_feet` true,

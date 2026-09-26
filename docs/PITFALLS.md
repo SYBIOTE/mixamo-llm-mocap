@@ -401,14 +401,14 @@ touching a clip a human has partially signed off.
     performer's in the overlay — and a rig with wider hips than the
     performer then angles its legs away from the video's (better on two
     plates, worse on three). Opt-in: `contact_image_anchor`.
-67. **A floating foot reads worse than a sliding one.** Through the spin
-    plate's turning footwork nothing says which foot is down (the network
-    stays under 0.3, the feet pivot on screen), and the retarget's feet
-    followed the estimate 3 cm above the floor. The legacy lift, which
-    simply put its lower foot on the floor, looked better to the owner
-    though it slid 5-10 times more. Where no evidence plants a foot and the
-    body is not in the air, plant the lower one — only there: everywhere,
-    it cost 0.5 deg of leg accuracy on plates whose feet other evidence
-    already plants. Smooth the pin correction a frame, or the body jolts
-    as the support changes feet (spin hips jerk x2).
+67. **Do not pin the body to a foot nobody saw down.** Through the spin
+    plate's turning footwork nothing says which foot is down, and the feet
+    floated 3 cm. Planting the lower foot there — the legacy lift's rule —
+    and pinning the body to it threw the overlay 106 px off the performer
+    at frame 158 (the estimate lowers the wrong foot as the performer
+    steps into the jump), and grounding the body on it every frame put the
+    jump 10 px low. What works: set the hovering foot down with its own
+    leg (height only), and let only OBSERVED contacts set the floor's
+    height. A support the retarget infers (one foot well above the other)
+    locks its foot; it does not move the body.
 
