@@ -61,6 +61,14 @@ claude mcp add blender -s user -- uvx --from "git+https://projects.blender.org/l
 and use `pipeline\blender_exec.py <script.py> [timeout]`, which speaks
 the add-on's socket protocol directly.
 
+## 2b. MediaPipe (foot keypoints for the SMPL-X path)
+
+`detect_feet.py` needs `mediapipe` and `opencv-python` in any Python on
+the machine (not the GVHMR venv): `pip install mediapipe opencv-python`.
+The Pose Landmarker model (`pose_landmarker_heavy.task`, ~30 MB) is
+downloaded to `tools/models/` on first use. Without MediaPipe the
+estimator still runs; the refinement then fits no heel/toe points.
+
 ## 3. GVHMR (the estimator)
 
 ```

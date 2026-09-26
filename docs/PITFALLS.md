@@ -248,3 +248,112 @@ touching a clip a human has partially signed off.
     the frames where contact is the point — separate an intended
     contact from an unintended one by asking what the source video
     does at that frame.
+
+## The SMPL-X path
+
+39. **Positions cannot carry twist.** The landmark lift rebuilt the
+    skeleton from 33 points and had to invent forearm roll, spine curve
+    and head orientation. The estimator had already solved all three:
+    transfer SMPL-X joint *rotations* (`retarget_smplx.py`), and align
+    rest poses only where they differ in pose (limbs), never where the
+    skeletons differ in proportion (spine, neck, head, collars).
+40. **GVHMR's world trajectory drifts, in all three axes.** Measured on
+    whole takes that end where they began: 0.3 m in depth (fight),
+    0.4 m sideways (kung-fu), 5–15 cm vertically (feet "planted" 15 cm
+    above the floor mid-clip). The camera-frame root is noisy but does
+    not drift. Take height from the camera continuously; apply the
+    horizontal correction per footfall, or it drags planted feet.
+41. **The network's contact confidence can be confidently wrong.** On the
+    kung-fu plate the right foot slides 0.2 m back under the body while
+    `static_conf` stays near 1; a lock there left the character in a
+    frog stance for the whole closing T-pose. On the spin plate it stays
+    under 0.4 for 200 frames of footwork with the feet on the floor.
+    Check every contact against foot speed and height, and add a
+    geometric pass once the floor is known.
+42. **A regressor flattens extremes.** GVHMR put the fight kick apex
+    0.10–0.18 m below where ViTPose saw the ankle in the frames it was
+    given. Refine the pose on the plate's own 2D keypoints
+    (`refine_smplx.py`) instead of sizing `leg_pose` corrections by hand.
+43. **Face keypoints are too small to steer a head.** At 4.7 m the face
+    spans ~25 px: a 3 px detection error is a 10° head turn. Refining
+    with full-weight face points rotated the head 17° on average; low
+    weight plus a strong head/neck prior brought it to 2°.
+44. **Linear resampling stutters.** Interpolating 24 fps samples linearly
+    to 30 fps puts a velocity kink at every source frame, a jerk spike
+    every fourth frame. Use a C1 spline on unrolled quaternions.
+45. **Smoothing a faithful retarget costs amplitude.** The raw GVHMR
+    rotations were not noisy; the legacy pre-filter was eating strikes
+    (fist speed 3.5 m/s vs 5–6 m/s). Even a gentle One-Euro filter cost
+    3–5 % of punch extension, so it is off by default.
+46. **Rest blends must not touch the legs.** Blending the whole body to
+    the rig's T-pose while the performer stands in a wide stance drags
+    both planted feet across the floor at up to 0.8 m/s. Settle the upper
+    body only.
+47. **A flat foot is the rig's flat foot.** Aligning the foot bone to the
+    SMPL-X ankle→ball direction carries SMPL-X foot geometry (a different
+    pitch) and lifts the ball 5 mm off the floor. For a planted foot keep
+    only the yaw of the alignment and lock that yaw for the whole stance,
+    or the toes swing around the locked ankle.
+48. **Joint centres are not keypoints.** A SMPL-X hip joint projects
+    ~8 cm below the COCO hip keypoint. Fit and compare with the same
+    definition (GVHMR's mesh-based COCO-17 regressor), and treat angle
+    metrics between different definitions as relative.
+49. **The ankle→ball joint line is not the foot.** On the SMPL-X template
+    it reads 18–22° of toe-out where the heel-to-toes line of the mesh
+    reads 5–6°. Aligning the rig's foot on the joint line turned every
+    retargeted foot out by ~15°. Measure the foot on the mesh, align yaw
+    only.
+50. **A 2D fit un-plants feet.** Refining the pose frame by frame on
+    detections moved feet GVHMR had pinned (planted-foot speed 0.3 →
+    3.5 cm/s median, 12 cm of creep over 0.8 s on the kung-fu plate) —
+    still in the image, sliding in the world. Re-pin the flagged feet
+    after refining, anchored on the stillest one (an average lets a foot
+    starting to lift drag the other).
+51. **A camera correction averaged over a stance is not the footfall's.**
+    During a 6 s deep stance the camera-frame depth drifted 0.2 m with the
+    pose; averaging it moved a planted foot 12 cm at the moment the other
+    foot lifted. Measure each footfall's correction when it lands.
+52. **The image is the best contact detector.** The camera is static: a
+    foot that does not move on screen is planted. GVHMR's flag missed
+    such feet for dozens of frames on the kung-fu plate (where the 3D
+    track crept), and the network flags some genuine slides as static.
+    Plant a low foot that is still on screen, lock only while the planted
+    point is still, and let a real slide follow the source.
+53. **A static heel can be up.** The rear foot of a boxing stance is
+    perfectly still on its ball. "Static" is not "flat": flat needs heel
+    AND ball near the floor; otherwise pivot on the lower point and keep
+    the real pitch.
+54. **Check a model file before trusting it.** The Pose Landmarker model
+    restored from shadow copy into `local/bible` starts with zeros — the
+    same damage as the plates noted in the video-mocap docs. A `.task` is
+    a zip: `detect_feet.py` checks for `PK` and downloads a fresh copy.
+55. **A long heel plant is the estimator's, not the performer's.** GVHMR
+    returns the planted rear foot of the kung-fu bow stance (4 s, leg
+    straight) with its toes 20° up and rolled 37° onto its edge; the 2D
+    refinement, pulled by a MediaPipe heel that lands mid-foot when the
+    foot faces the camera, takes it to 29°. The video shows it flat. The
+    image cannot arbitrate — a toe-up foot and a flat one turned 12°
+    project within a pixel of each other — but weight-bearing can: heel
+    strikes and turns on the heel last a fraction of a second, so a heel
+    plant held longer is laid flat.
+56. **A tilted foot's heading is not its axis's heading.** The heading of
+    a foot rolled 37° onto its edge, read off its tilted forward axis,
+    was 6° off the direction it points in once laid flat. Flatten first
+    (minimal rotation to the floor), then read the heading.
+57. **A planted foot's heading cannot be fitted to 2D keypoints.** Seen
+    from the side, turning a foot moves its toes in depth: 1 cm of error
+    in where the detector puts the ankle or the toe (MediaPipe's toe is
+    the big toe tip, its heel sits 3-4 cm up the back of the heel) is
+    ~15° of heading. Seen from the front it is the heights that dominate.
+    Tried and dropped: a per-stance yaw fit to the ankle→toe line gave
+    sub-degree residuals and moved feet 5-17° in both directions; which
+    way depended on the landmark definition chosen. Keep the source's
+    heading, and treat foot-angle metrics against MediaPipe as ±5°.
+58. **GVHMR's gravity is a few degrees off the plate's floor.** On all
+    five plates the up vector of feet GVHMR itself flags as planted, and
+    the plane through their soles, lean 2-10° (mostly in pitch) from the
+    world up GVHMR reports. The whole take is then leaning by that much
+    relative to the floor it stands on — invisible from the plate's own
+    camera, visible from the side. Not corrected yet: re-levelling the
+    world on the planted soles is the next step.
+

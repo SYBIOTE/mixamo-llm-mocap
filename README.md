@@ -27,6 +27,37 @@ the performers actually stood, measured from the footage.*
 
 ## How it works
 
+The default path transfers the estimator's SMPL-X **joint rotations**
+and runs without the Blender UI:
+
+```
+video plate (locked camera)
+   │
+   ├─ 1. estimate_pose_gvhmr.py --smplx-only   GVHMR → SMPL-X parameters, refined on the plate's 2D keypoints (+ heels/toes)
+   ├─ 2. retarget_smplx.py                     rotations → your Mixamo rig; floor, foot locks, camera-true trajectory
+   ├─ 3. bl_motion.py  (blender -b)            key the action in bulk and save it, or render — no MCP session
+   ├─ 4. render_review.py                      2×2 review video: plate | overlay on the plate / before | after
+   └─ 5. eval_fidelity.py                      limb and head angles vs the video's keypoints, foot slide, jitter
+```
+
+- **Twist is real.** Forearm roll, spine curve and head orientation come
+  from SMPL-X instead of being re-derived from positions.
+- **Extremes survive.** GVHMR flattens fast limbs; a SMPLify-style fit on
+  the plate's own ViTPose keypoints puts a head-high kick back at head
+  height.
+- **Feet point where the performer's point.** Heel and toe keypoints
+  (MediaPipe) join the fit, and the rig's foot is aligned on the foot's
+  real axis — toe-out, heel raises and pivots come from the video.
+- **Feet stay down.** Contacts from GVHMR's detector, the floor, and the
+  image itself (a foot still on screen is planted); planted feet lock
+  flat or pivot on the point that carries the weight.
+- **The trajectory is the camera's.** The plate's static camera is
+  recovered; height drift is removed continuously and horizontal drift
+  one footfall at a time, so the character ends on its mark.
+
+The original landmark path below is still available for existing
+specs and the two-character tooling:
+
 ```
 video plate (locked camera, T-pose bookends)
    │
@@ -115,7 +146,21 @@ airborne beats), when fists close, where the clip locks back to rest.
    blender --background --python pipeline\setup_rig.py -- --fbx ybot.fbx --out ybot_rest.blend
    ```
 
-3. **Run a plate** (Blender open on the scene; plate rules in
+3. **Run a plate — SMPL-X path** (headless, no Blender window needed):
+
+   ```
+   tools\GVHMR\.venv\Scripts\python.exe pipeline\estimate_pose_gvhmr.py --video plates\<name>\<name>.mp4 --out plates\<name>\landmarks.json --smplx-only
+   python pipeline\retarget_smplx.py --spec action_specs\<name>.json
+   blender -b ybot_rest.blend -P pipeline\bl_motion.py -- apply --motion clips\<clip>\motion.npz --save clips\<clip>\<clip>.blend
+   python pipeline\render_review.py --spec action_specs\<name>.json --clip clips\<clip>
+   python pipeline\eval_fidelity.py --spec action_specs\<name>.json --clip clips\<clip>
+   ```
+
+   A spec needs only `name`, `action_name`, `clip_dir`, `landmarks` and
+   the fps; `fists`, rest blends and `arm_overrides` are optional.
+   Details: [docs/PIPELINE.md](docs/PIPELINE.md) section S.
+
+   **Or the landmark path** (Blender open on the scene; plate rules in
    [docs/PROMPTING.md](docs/PROMPTING.md)):
 
    ```
@@ -146,7 +191,7 @@ airborne beats), when fists close, where the clip locks back to rest.
 |---|---|---|
 | **A Mixamo character — any model** | [mixamo.com](https://www.mixamo.com) → Characters → download FBX Binary, T-pose | Adobe's terms don't allow redistributing them; `setup_rig.py` builds and validates the scene from your download |
 | **Blender 5.1+** | [blender.org](https://www.blender.org/download/) | |
-| **Blender MCP add-on** (official, Blender Lab) | [blender.org/lab/mcp-server](https://www.blender.org/lab/mcp-server/) | enable *Allow Online Access*; the apply talks to its socket |
+| **Blender MCP add-on** (official, Blender Lab) — landmark path only | [blender.org/lab/mcp-server](https://www.blender.org/lab/mcp-server/) | enable *Allow Online Access*; the legacy apply talks to its socket. The SMPL-X path runs `blender -b` and needs no add-on |
 | **GVHMR** (the pose estimator — **not in this repo**) | [github.com/zju3dv/GVHMR](https://github.com/zju3dv/GVHMR) | clone into `tools/GVHMR`; install per [docs/INSTALL.md](docs/INSTALL.md) — including a working Windows recipe (`docs/requirements_gvhmr_windows.txt` + prebuilt pytorch3d wheel) |
 | **GVHMR checkpoints** (~5 GB) | HuggingFace mirror | exact `curl` commands in [docs/INSTALL.md](docs/INSTALL.md) |
 | **SMPL-X body model** | [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de/) | free research registration → download *SMPL-X v1.1*, place `SMPLX_NEUTRAL.npz` as shown in [docs/INSTALL.md](docs/INSTALL.md) |

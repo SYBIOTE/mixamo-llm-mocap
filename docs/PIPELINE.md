@@ -1,8 +1,173 @@
 # The pipeline, operationally
 
 How a video becomes a Y Bot clip, stage by stage, with the decision
-rules an operator (human or AI) needs. Everything here was validated on
-the two shipped clips.
+rules an operator (human or AI) needs.
+
+There are two retarget paths. **The SMPL-X path (section S, below) is
+the default**: it transfers the estimator's joint rotations, solves the
+floor, foot contacts and trajectory from the video, and runs entirely
+headless. The **landmark path** (sections 1–10) is the original one:
+positions only, corrected by hand with spec fields over review passes.
+It is kept for existing clips and for its two-character tooling.
+
+## S. The SMPL-X path
+
+```
+plate.mp4
+  └─ estimate_pose_gvhmr.py --smplx-only   → smplx.npz (+ smplx_raw.npz)
+       └─ retarget_smplx.py --spec ...       → <clip_dir>/motion.npz, curves.json
+            ├─ bl_motion.py apply|render     (blender -b: keys / renders, no MCP)
+            ├─ render_review.py              → review_<view>.mp4 (2×2 grid)
+            └─ eval_fidelity.py              → fidelity.json
+```
+
+```
+tools\GVHMR\.venv\Scripts\python.exe pipeline\estimate_pose_gvhmr.py --video plates\<p>\<p>.mp4 --out plates\<p>\landmarks.json --smplx-only
+    (runs detect_feet.py for heel/toe keypoints, then the 2D refinement)
+python pipeline\retarget_smplx.py --spec action_specs\<motion>.json --rig-profile rig_profiles\ybot.json
+blender -b ybot_rest.blend -P pipeline\bl_motion.py -- apply --motion clips\<clip>\motion.npz --save clips\<clip>\<clip>.blend
+python pipeline\render_review.py --spec action_specs\<motion>.json --clip clips\<clip> [--legacy clips\<old_clip>]
+python pipeline\eval_fidelity.py --spec action_specs\<motion>.json --clip clips\<clip> [--vs clips\<old_clip>]
+```
+
+The rig profile must carry the bone table: `setup_rig.py` writes it; for
+an older profile run
+`blender -b <rig>_rest.blend -P pipeline\bl_motion.py -- dump-rig --profile <profile.json>`.
+
+### S.1 Estimate (and refine)
+
+`estimate_pose_gvhmr.py` now keeps what GVHMR computes instead of
+reducing it to 33 points: `smplx.npz` holds the SMPL-X parameters in the
+world frame and in the camera frame, the camera intrinsics, the
+performer's shaped rest skeleton and foot geometry, GVHMR's per-frame
+contact confidences and the ViTPose 2D keypoints.
+
+- `--postproc feet` (default) keeps GVHMR's foot clean-up but never
+  treats a wrist as static: `full`, GVHMR's demo behaviour, can hold a
+  fist back at the apex of a punch.
+- **Foot keypoints** (`detect_feet.py`, run automatically). COCO-17
+  stops at the ankle, so nothing in GVHMR's input says which way a foot
+  points or whether its heel is up. MediaPipe's Pose Landmarker tracks the
+  heel and the toe tip of each foot; `feet2d.npz` is cached next to the
+  plate. MediaPipe is not in the GVHMR venv: the estimator calls
+  `detect_feet.py` with a Python that has it (`--feet-python`, else
+  `python` on PATH) and refines without feet if none is found. The model
+  file is downloaded to `tools/models/` on first use.
+- **Refinement** (`refine_smplx.py`, on by default, `--no-refine` to
+  skip). GVHMR regresses toward typical motion and flattens extremes:
+  the fight kick apex came out 35–65 px (0.10–0.18 m) below where
+  ViTPose sees the ankle in the same frames. The body pose is optimised
+  so the model's COCO-17 keypoints (the same mesh-based definition as the
+  detector's) and its heel/toe vertices land on the detections, with a
+  prior toward GVHMR's pose, a smooth correction, low weight on the tiny
+  face points, a strong prior on head and neck, and one physical rule: when
+  GVHMR has both feet planted, their lowest points share one height (a 2D
+  fit cannot see depth and otherwise tilts a wide stance). Keypoint error
+  at the subject goes 2–4 cm → ~1 cm, heel/toe 2.5–6 cm → ~1 cm. The raw
+  estimate is kept as `smplx_raw.npz`.
+
+### S.2 Retarget
+
+`retarget_smplx.py` reads the same action_spec as the legacy lift and
+uses only what a video cannot know:
+
+| Spec field | Used for |
+|---|---|
+| `smplx` (optional) | the parameters file (default: `smplx.npz` next to `landmarks`) |
+| `rig_profile`, `action_name`, `clip_dir`, `dst_fps` | as before |
+| `fists` | fist windows; hands hold a relaxed curl elsewhere |
+| `rest_blend_start` / `rest_blend_end` | settle the **upper body** into the rig's exact T-pose; legs and root keep the performer's real stance |
+| `arm_overrides` | authored wrist/elbow targets for an arm the estimator could not see (same schema, two-bone solve, the hand rides along) |
+| `smplx_retarget` | tuning block, below |
+
+`plant`, `smooth`, `reach`, `arm_pose`, `arm_follow`, `leg_pose`,
+`head_look` and `root_offset` belong to the landmark lift and are
+ignored: contacts, head orientation and extension come from the video.
+
+What the stage does, in order:
+
+1. **Resample** 24 → 30 fps: local rotations on a C1 spline of unrolled
+   quaternions (linear interpolation leaves a velocity kink at every
+   plate frame).
+2. **Camera-consistent trajectory.** The static camera is fitted from the
+   world and camera-frame roots over the first frames. Height is taken
+   from the camera continuously (GVHMR's world track drifts 5–15 cm
+   vertically); horizontal drift (up to 0.45 m on these plates) is
+   applied one footfall at a time, so a planted foot never slides to pay
+   for it.
+3. **Contacts.** Three kinds of evidence, any of which plants a foot
+   that is low: GVHMR's static confidence (validated by foot speed and
+   height), a still sole on the floor once the floor is known, and a foot
+   that does not move **on screen** (ankle, heel and toe keypoints; the
+   camera is static, so still in the image is still in the world). Runs of
+   the same foot separated by a confidence dip, with the foot unmoved,
+   are joined.
+4. **Planted feet stay put**: where a foot is flagged, the body's
+   horizontal translation absorbs the foot's motion (the refinement
+   changes the legs frame by frame; this is GVHMR's own rule, re-applied
+   on the refined pose, anchored on the stillest foot).
+5. **Floor**: on planted frames the lowest sole goes on the floor.
+6. **Camera footfalls**: each footfall takes the camera correction
+   measured when it lands; later disagreement while it stays planted is
+   the camera's depth estimate breathing with the pose.
+7. **Rotation copy**: `P_b = S_j · A_b · B_b` in armature space (the
+   Mixamo armature's own axes are SMPL-X's). `A_b` aligns rest
+   directions for thighs, shins, upper arms and forearms; feet are
+   aligned in yaw only, measured heel-to-toes on the SMPL-X mesh (the
+   ankle→ball joint direction reads 15° more toe-out than the foot
+   has). Hands and toes inherit their parent's. Spine, neck, head and
+   collars are not aligned: there the skeletons differ in proportion,
+   not pose.
+8. **Root and legs**: the pelvis trajectory is scaled by the leg-length
+   ratio; each leg is re-solved so the ankle lands where the performer's
+   scaled leg puts it, knee in the source's plane.
+9. **Foot locks**: heel and ball down locks the ankle and lays the rig's
+   own flat foot at the stance's median heading — the heading of the
+   source foot laid flat, so a foot the estimate rolls onto its edge keeps
+   the direction it points in; otherwise the foot pivots on whichever
+   point is lower (ball for a raised heel, heel for a toe-up plant) and
+   keeps its real pitch. A toe-up heel plant held longer than 0.5 s is
+   laid flat: heel strikes and turns on the heel are brief, and GVHMR
+   returns the planted rear foot of a long stance toes-up (see
+   PITFALLS 55). Toes lie on the floor on flat and ball contacts. A lock
+   only holds while the planted point is still: stretches where it slides
+   are left to follow the source smoothly, and a lock that drifts more
+   than 4 cm is cut. Ramps of 4 frames. A lock a leg cannot reach lowers
+   the hips, at most 5 cm.
+10. Hands, rest blends, then local quaternions for every bone and the
+    Hips location, plus the plate camera (for the overlay) and QA numbers.
+
+`smplx_retarget` keys (defaults): `contact_threshold` 0.5,
+`contact_max_speed` 0.3 m/s, `contact_max_height` 0.06 m,
+`contact_heel_height` 0.03 m, `contact_geo_height` 0.025 m,
+`contact_geo_speed` 0.2 m/s, `contact_still_px` 15 px/s,
+`contact_slide_speed` 0.12 m/s, `contact_max_drift` 0.04 m,
+`contact_heel_max_s` 0.5 s, `contact_ramp` 4, `max_hips_drop` 0.05 m,
+`ground_sigma` 3, `hand_relaxed` 0.3, `pin_static_feet` true,
+`camera_root` true, `camera_fit_frames` 12, `camera_landing_frames` 6,
+and an optional
+`smooth: {"min_cutoff": 3, "beta": 8}` (One-Euro). Smoothing is **off**
+by default: even the gentlest setting cost 3–5 % of punch extension and
+3 cm of kick height on the fight plate.
+
+### S.3 Review and measure
+
+`render_review.py` renders headlessly and writes one 2×2 video per view:
+the plate, the clip rendered through the plate's recovered camera and
+composited over it, and (with `--legacy`) the old clip next to the new
+one with the same camera and look. The overlay is the check to trust:
+where character and performer disagree, it is visible.
+
+`eval_fidelity.py` projects the clip through that camera and compares
+every limb's on-screen angle with the ViTPose keypoints on every plate
+frame, each foot's ankle→toe line with MediaPipe's, and reports
+planted-foot slide (on the frames GVHMR flags, not the clip's own
+locks), sole height and jerk. Read the angles as relative: joint centres
+and COCO keypoints are different anatomical points (GVHMR's own
+skeleton scores ~5.9° on the fight plate), and the foot line of a rig
+with a higher ankle and a longer foot than the performer's differs from
+MediaPipe's ankle→big-toe line by a few degrees on its own — treat the
+foot number as ±5° and judge finer differences on the overlay.
 
 ## 0. The plate (source video)
 
