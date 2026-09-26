@@ -349,11 +349,56 @@ touching a clip a human has partially signed off.
     sub-degree residuals and moved feet 5-17° in both directions; which
     way depended on the landmark definition chosen. Keep the source's
     heading, and treat foot-angle metrics against MediaPipe as ±5°.
-58. **GVHMR's gravity is a few degrees off the plate's floor.** On all
-    five plates the up vector of feet GVHMR itself flags as planted, and
-    the plane through their soles, lean 2-10° (mostly in pitch) from the
-    world up GVHMR reports. The whole take is then leaning by that much
-    relative to the floor it stands on — invisible from the plate's own
-    camera, visible from the side. Not corrected yet: re-levelling the
-    world on the planted soles is the next step.
+58. **Planted feet disagree with GVHMR's gravity — the feet, not the
+    gravity.** The up vector of feet GVHMR flags as planted, and the plane
+    through their soles, lean 2–10° from GVHMR's world up on all five
+    plates. But a T-posed body stands within 1–2° of that same up, and the
+    feet stand 0–12° toes-up with different values for the two feet of one
+    take: it is the estimator's foot tilt (#64), not a tilted world. Do
+    not re-level the world on the feet.
+59. **The estimator slides the support foot.** Through the spin plate's
+    kicks GVHMR moved the standing foot at up to 2 m/s and sank it 4–10 cm
+    into the floor, while the video shows it fixed (the toe does not move
+    on screen). Its contact flag stayed under 0.3. One foot 15 cm above
+    the other means the lower one carries the body: plant it, and pin the
+    body's translation to it (to its ball when the heel is up, so the body
+    turns about it).
+60. **Raising the body for one sinking foot floats the other.** Between
+    contacts a free foot can go under the floor; lifting the hips to clear
+    it left the other, correctly planted foot 8 cm in the air (spin,
+    turning footwork). Lift the sinking foot with its own leg.
+61. **A pivoting foot is down, not locked.** Counting a foot as planted
+    when only its ball or heel is still on screen merged two kung-fu
+    stances across a turn on the heel: one lock position for both, legs
+    stretched, hips dropped to the cap, 0.3–0.7° worse leg angles, and no
+    gain on the spin plate. Only whole-foot stillness may hold a lock.
+62. **One heading cannot span a turn.** A flat lock keeps its median
+    heading; a stance that pivots 90° on its heel barely moves the ankle,
+    so the drift cut never fires. Cut the lock when the foot's heading
+    moves 20° (uppercut: foot direction 11.5° → 7.8°).
+63. **Fingers need a zoom.** On a full-body 1280×720 plate a hand is
+    30–50 px: MediaPipe's palm detector, run on the frame, finds nothing
+    usable. Cropped around the ViTPose wrist and upscaled to 256 px, the
+    hand is found on 83–100 % of frames. The same zoom does nothing for
+    the feet: MediaPipe's pose model looks at the whole body at a fixed
+    256 px whatever the plate's resolution.
+64. **GVHMR's feet carry a steady tilt.** Over the frames the network
+    calls the whole foot static, its feet stand 0–12° toes-up and rolled a
+    few degrees — steadily through a take, differently per foot. Flat locks
+    hide it while planted; it shows as a flap at every lock ramp and a
+    toes-up swing foot. Measure it on the static frames and take it off
+    every frame: leg angles 0.1–0.4° better on four plates, foot direction
+    better on all five (kung-fu 7.1° → 5.3°).
+65. **Matching the performer's stance width breaks the legs.** The Y Bot's
+    hip joints are 18 cm apart, the performers' 11–13 cm scaled, so
+    hip-relative leg targets stand its feet ~3 cm wider each. Targets from
+    the hip centre instead cost 1.5–2.3° on the leg angles of every plate
+    and overshot in the overlay: the width is the rig's, keep it.
+66. **The image places a planted foot sideways, not in depth.** The ray
+    from the plate camera through the detected ankle meets the floor at
+    12–19°; 1 cm of error in the ankle's height is 3–4 cm of depth. Moved
+    across the line of sight only, planted feet sit exactly on the
+    performer's in the overlay — and a rig with wider hips than the
+    performer then angles its legs away from the video's (better on two
+    plates, worse on three). Opt-in: `contact_image_anchor`.
 

@@ -17,7 +17,7 @@ plate.mp4
   └─ estimate_pose_gvhmr.py --smplx-only   → smplx.npz (+ smplx_raw.npz)
        └─ retarget_smplx.py --spec ...       → <clip_dir>/motion.npz, curves.json
             ├─ bl_motion.py apply|render     (blender -b: keys / renders, no MCP)
-            ├─ render_review.py              → review_<view>.mp4 (2×2 grid)
+            ├─ render_review.py              → review_<view>.mp4 (2×2 grid), review_details.mp4 (zoom)
             └─ eval_fidelity.py              → fidelity.json
 ```
 
@@ -53,6 +53,15 @@ contact confidences and the ViTPose 2D keypoints.
   `detect_feet.py` with a Python that has it (`--feet-python`, else
   `python` on PATH) and refines without feet if none is found. The model
   file is downloaded to `tools/models/` on first use.
+- **Hand keypoints** (`detect_hands.py`, run automatically after the
+  raw export). GVHMR estimates no fingers, and on a full-body 720p plate
+  a hand is 30–50 px — a hand detector run on the frame sees a blob. Each
+  hand is cropped around its ViTPose wrist (a third of a forearm beyond
+  it, 0.9 forearm half-size), upscaled to 256 px, and MediaPipe's Hand
+  Landmarker reads 21 points there; the detection nearest the expected
+  wrist is kept. Found on 83–100 % of the frames of the five test plates
+  (fists, open hands, a motion-blurred punch). `hands2d.npz` is cached
+  next to the plate.
 - **Refinement** (`refine_smplx.py`, on by default, `--no-refine` to
   skip). GVHMR regresses toward typical motion and flattens extremes:
   the fight kick apex came out 35–65 px (0.10–0.18 m) below where
@@ -88,24 +97,37 @@ What the stage does, in order:
 
 1. **Resample** 24 → 30 fps: local rotations on a C1 spline of unrolled
    quaternions (linear interpolation leaves a velocity kink at every
-   plate frame).
+   plate frame). Then **the feet's steady tilt** comes off: GVHMR stands
+   each foot 0–12° toes-up and rolled, differently per foot but steadily
+   through a take. Its median tilt over the frames the network calls the
+   whole foot static (ankle and ball > 0.8) is removed from every frame,
+   capped at 12° (`foot_tilt_fix`). Planted feet lock flat anyway; the
+   bias showed as a flap at each lock ramp and a toes-up swing foot, and
+   removing it improved leg angles on four plates of five and foot
+   direction on all.
 2. **Camera-consistent trajectory.** The static camera is fitted from the
    world and camera-frame roots over the first frames. Height is taken
    from the camera continuously (GVHMR's world track drifts 5–15 cm
    vertically); horizontal drift (up to 0.45 m on these plates) is
    applied one footfall at a time, so a planted foot never slides to pay
    for it.
-3. **Contacts.** Three kinds of evidence, any of which plants a foot
-   that is low: GVHMR's static confidence (validated by foot speed and
-   height), a still sole on the floor once the floor is known, and a foot
-   that does not move **on screen** (ankle, heel and toe keypoints; the
-   camera is static, so still in the image is still in the world). Runs of
-   the same foot separated by a confidence dip, with the foot unmoved,
-   are joined.
-4. **Planted feet stay put**: where a foot is flagged, the body's
-   horizontal translation absorbs the foot's motion (the refinement
-   changes the legs frame by frame; this is GVHMR's own rule, re-applied
-   on the refined pose, anchored on the stillest foot).
+3. **Contacts.** Four kinds of evidence plant a foot: GVHMR's static
+   confidence (validated by foot speed and height), a still sole on the
+   floor once the floor is known, a foot that does not move **on screen**
+   (median speed of ankle, heel and toe keypoints on median-filtered
+   tracks, sole within 12 cm of the floor — the estimate can leave a
+   planted foot 6–9 cm up; the camera is static, so still in the image is
+   still in the world), and **single support**: when one foot is more than
+   15 cm above the other and the lower one is within 10 cm of the floor,
+   the lower one carries the body — through the spin plate's kicks GVHMR
+   slides it at up to 2 m/s while the video shows it fixed. Runs of the
+   same foot separated by a confidence dip, with the foot unmoved, are
+   joined.
+4. **Planted feet stay put**: where a foot is flagged (network, image, or
+   single support), the body's horizontal translation absorbs the foot's
+   motion (GVHMR's own rule, re-applied on the refined pose, anchored on
+   the stillest flagged joint: the ball of a support foot whose heel is
+   up, so the body turns about it).
 5. **Floor**: on planted frames the lowest sole goes on the floor.
 6. **Camera footfalls**: each footfall takes the camera correction
    measured when it lands; later disagreement while it stays planted is
@@ -130,25 +152,52 @@ What the stage does, in order:
    laid flat: heel strikes and turns on the heel are brief, and GVHMR
    returns the planted rear foot of a long stance toes-up (see
    PITFALLS 55). Toes lie on the floor on flat and ball contacts. A lock
-   only holds while the planted point is still: stretches where it slides
-   are left to follow the source smoothly, and a lock that drifts more
-   than 4 cm is cut. Ramps of 4 frames. A lock a leg cannot reach lowers
-   the hips, at most 5 cm.
-10. Hands, rest blends, then local quaternions for every bone and the
-    Hips location, plus the plate camera (for the overlay) and QA numbers.
+   only holds while the planted point is still (a single-support foot,
+   or one still on screen, always is): stretches where it slides are left
+   to follow the source smoothly, a lock that drifts more than 4 cm is
+   cut, and so is a flat lock whose foot turns more than 20° (a stance
+   pivoting on its heel gets a heading per piece). Ramps of 4 frames. A
+   lock a leg cannot reach lowers the hips, at most 5 cm. A free foot the
+   estimate carries more than 1 cm under the floor is lifted by its own
+   leg (`sink_tolerance`: a toe grazing the floor is left alone — lifting
+   it bends the knee away from the video).
+10. **Fingers** from `hands2d.npz`: per finger joint, the angle between
+    consecutive bones of MediaPipe's metric landmarks (view-independent),
+    median-filtered over confident frames and smoothed; each Mixamo
+    finger bone bends by it about the axis of the rig-validated fist
+    (capped a little past the fist), the thumb follows one curl. Where
+    the detector lost the hand for more than a few frames, the spec's
+    `fists` windows and the relaxed curl (`hand_relaxed`) take over.
+11. Rest blends, then local quaternions for every bone and the Hips
+    location, plus the plate camera (for the overlay) and QA numbers.
 
 `smplx_retarget` keys (defaults): `contact_threshold` 0.5,
 `contact_max_speed` 0.3 m/s, `contact_max_height` 0.06 m,
 `contact_heel_height` 0.03 m, `contact_geo_height` 0.025 m,
 `contact_geo_speed` 0.2 m/s, `contact_still_px` 15 px/s,
 `contact_slide_speed` 0.12 m/s, `contact_max_drift` 0.04 m,
-`contact_heel_max_s` 0.5 s, `contact_ramp` 4, `max_hips_drop` 0.05 m,
-`ground_sigma` 3, `hand_relaxed` 0.3, `pin_static_feet` true,
+`contact_heel_max_s` 0.5 s, `contact_still_height` 0.12 m,
+`contact_swing_height` 0.15 m, `contact_support_height` 0.10 m,
+`contact_max_turn_deg` 20, `sink_tolerance` 0.01 m, `foot_tilt_fix` true,
+`contact_image_anchor` false (with `contact_anchor_max` 0.12 m,
+`contact_anchor_drop` 0.015 m), `contact_ramp` 4, `max_hips_drop` 0.05 m,
+`ground_sigma` 3, `hand_relaxed` 0.3, `hand_detect` true, `pin_static_feet` true,
 `camera_root` true, `camera_fit_frames` 12, `camera_landing_frames` 6,
 and an optional
 `smooth: {"min_cutoff": 3, "beta": 8}` (One-Euro). Smoothing is **off**
 by default: even the gentlest setting cost 3–5 % of punch extension and
 3 cm of kick height on the fight plate.
+
+`contact_image_anchor` moves each flat lock across the line of sight to
+where the plate shows the ankle (the camera ray through ViTPose's ankle,
+met by the plane at the performer's ankle height). It puts planted feet
+exactly on the performer's in the overlay, but it is off by default: a rig
+with wider hips than the performer (the Y Bot's hip joints are 18 cm
+apart, the performers' 11–13 cm scaled) must then angle its legs away
+from the video's — leg angles 0.3° better on two plates, 0.2–0.6° worse on
+three. Along the line of sight the image cannot place a foot at all: the
+ray meets the floor at 12–19°, where 1 cm of ankle height is 3–4 cm of
+depth.
 
 ### S.3 Review and measure
 
@@ -156,7 +205,11 @@ by default: even the gentlest setting cost 3–5 % of punch extension and
 the plate, the clip rendered through the plate's recovered camera and
 composited over it, and (with `--legacy`) the old clip next to the new
 one with the same camera and look. The overlay is the check to trust:
-where character and performer disagree, it is visible.
+where character and performer disagree, it is visible. It also writes
+`review_details.mp4`: both hands and both feet zoomed, plate and overlay
+side by side, following the wrists and ankles (the plate camera's view is
+rendered at twice the plate's resolution for it; `--no-details` skips
+it) — fists, fingers and foot placement can be judged there.
 
 `eval_fidelity.py` projects the clip through that camera and compares
 every limb's on-screen angle with the ViTPose keypoints on every plate
@@ -168,6 +221,32 @@ skeleton scores ~5.9° on the fight plate), and the foot line of a rig
 with a higher ankle and a longer foot than the performer's differs from
 MediaPipe's ankle→big-toe line by a few degrees on its own — treat the
 foot number as ±5° and judge finer differences on the overlay.
+
+### S.4 What the literature adds, and what it would take
+
+A last survey (September 2026) of what could push the feet further:
+
+- **Contact handling** is where the pipeline already matches the
+  references: footskate cleanup by constrained IK with blended edges
+  (Kovar, Schreiner & Gleicher 2002), and game-style foot locking with
+  0.1–0.2 s inertialized engage/release, locking the part of the foot that
+  carries the weight and letting a real slide go (Holden, *Inverse
+  Kinematics and Foot Locking*). Ramps here are smootherstep over 4 frames
+  (0.13 s).
+- **Learned contact detectors** (UnderPressure 2022, ContactVision 2025)
+  and **physics tracking** (PhysCap; CRISP 2025, which fits planar
+  support surfaces to contacts and imitates the motion with an RL
+  controller) remove the remaining implausibility — a character that
+  cannot push off a floor it does not touch — at the cost of a simulator
+  or a trained model per plate. That is the next level, not a tuning.
+- **Post-refinement of GVHMR** by aligning velocities and accelerations
+  predicted from the video (HTD-Refine 2026) cut jitter 58 % and world
+  MPJPE 42 % on EMDB, but needs its learned velocity network; the idea
+  that transfers — penalise jerk, keep contacts by IK — is already here,
+  and pre-smoothing was measured to cost punch extension.
+- **Hands**: HaMeR/WiLoR recover MANO hands from crops and would beat
+  MediaPipe on blurred fists, but need the gated MANO model; the crop-
+  then-detect pattern is the same one `detect_hands.py` uses.
 
 ## 0. The plate (source video)
 

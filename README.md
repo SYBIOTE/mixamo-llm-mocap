@@ -33,10 +33,10 @@ and runs without the Blender UI:
 ```
 video plate (locked camera)
    │
-   ├─ 1. estimate_pose_gvhmr.py --smplx-only   GVHMR → SMPL-X parameters, refined on the plate's 2D keypoints (+ heels/toes)
+   ├─ 1. estimate_pose_gvhmr.py --smplx-only   GVHMR → SMPL-X parameters, refined on the plate's 2D keypoints (+ heels/toes, + zoomed hands)
    ├─ 2. retarget_smplx.py                     rotations → your Mixamo rig; floor, foot locks, camera-true trajectory
    ├─ 3. bl_motion.py  (blender -b)            key the action in bulk and save it, or render — no MCP session
-   ├─ 4. render_review.py                      2×2 review video: plate | overlay on the plate / before | after
+   ├─ 4. render_review.py                      2×2 review video: plate | overlay on the plate / before | after, + hands & feet zoomed
    └─ 5. eval_fidelity.py                      limb and head angles vs the video's keypoints, foot slide, jitter
 ```
 
@@ -48,9 +48,14 @@ video plate (locked camera)
 - **Feet point where the performer's point.** Heel and toe keypoints
   (MediaPipe) join the fit, and the rig's foot is aligned on the foot's
   real axis — toe-out, heel raises and pivots come from the video.
-- **Feet stay down.** Contacts from GVHMR's detector, the floor, and the
-  image itself (a foot still on screen is planted); planted feet lock
-  flat or pivot on the point that carries the weight.
+- **Feet stay down.** Contacts from GVHMR's detector, the floor, the
+  image itself (a foot still on screen is planted) and physics (a foot
+  carrying the body alone is planted, whatever the estimate says);
+  planted feet lock flat or pivot on the point that carries the weight,
+  and no foot goes under the floor.
+- **Fingers from the video.** GVHMR has no fingers: each hand is cropped
+  around its wrist, zoomed, and read by a hand detector; fists, open hands
+  and the thumb follow the performer.
 - **The trajectory is the camera's.** The plate's static camera is
   recovered; height drift is removed continuously and horizontal drift
   one footfall at a time, so the character ends on its mark.

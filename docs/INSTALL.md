@@ -63,11 +63,14 @@ the add-on's socket protocol directly.
 
 ## 2b. MediaPipe (foot keypoints for the SMPL-X path)
 
-`detect_feet.py` needs `mediapipe` and `opencv-python` in any Python on
-the machine (not the GVHMR venv): `pip install mediapipe opencv-python`.
-The Pose Landmarker model (`pose_landmarker_heavy.task`, ~30 MB) is
-downloaded to `tools/models/` on first use. Without MediaPipe the
-estimator still runs; the refinement then fits no heel/toe points.
+`detect_feet.py` and `detect_hands.py` need `mediapipe` and
+`opencv-python` in any Python on the machine (not the GVHMR venv):
+`pip install mediapipe opencv-python`. The Pose Landmarker model
+(`pose_landmarker_heavy.task`, ~30 MB) and the Hand Landmarker model
+(`hand_landmarker.task`, ~8 MB) are downloaded to `tools/models/` on
+first use. Without MediaPipe the estimator still runs; the refinement
+then fits no heel/toe points and the fingers keep a relaxed curl (fists
+inside the spec's `fists` windows).
 
 ## 3. GVHMR (the estimator)
 
